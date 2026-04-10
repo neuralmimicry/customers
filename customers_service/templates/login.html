@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="rag-api-base" content="{{ api_base or '' }}">
+  <title>NeuralMimicry Customers Login</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <main class="shell">
+    <section class="card auth-card">
+      <p class="eyebrow">NeuralMimicry Customers</p>
+      <h1>Sign in</h1>
+      <p class="subtitle">Authenticate once, then access Refiner, billing, and other NeuralMimicry services through the shared session.</p>
+      <p id="authError" class="auth-error" {% if not error %}hidden{% endif %}>{{ error }}</p>
+      {% if local_enabled %}
+      <form id="authForm" data-auth="login" data-next="{{ next_path or '/' }}" method="post" class="auth-form">
+        <label class="field">
+          <span>Username</span>
+          <input id="username" name="username" type="text" required autocomplete="username">
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input id="password" name="password" type="password" required autocomplete="current-password">
+        </label>
+        <button type="submit" class="primary">Login</button>
+      </form>
+      {% endif %}
+      {% if oidc_enabled %}
+      {% if local_enabled %}
+      <div class="auth-divider">or</div>
+      {% endif %}
+      <a class="primary auth-link" href="{{ url_for('oidc_login', next=(next_path or '/')) }}">{{ oidc_label }}</a>
+      {% endif %}
+      {% if not local_enabled and not oidc_enabled %}
+      <p class="hint">No authentication providers are available yet.</p>
+      {% endif %}
+    </section>
+  </main>
+  <script src="{{ url_for('static', filename='auth.js') }}"></script>
+</body>
+</html>

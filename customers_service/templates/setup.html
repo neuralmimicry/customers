@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="rag-api-base" content="{{ api_base or '' }}">
+  <title>NeuralMimicry Customers Setup</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <main class="shell">
+    <section class="card auth-card">
+      <p class="eyebrow">NeuralMimicry Customers</p>
+      <h1>Create the first administrator</h1>
+      <p class="subtitle">This bootstraps the shared identity service used by Refiner, billing, and internal service-to-service session checks.</p>
+      <p id="authError" class="auth-error" {% if not error %}hidden{% endif %}>{{ error }}</p>
+      <form id="authForm" data-auth="setup" data-next="{{ next_path or '/' }}" method="post" class="auth-form">
+        <label class="field">
+          <span>Admin username</span>
+          <input id="username" name="username" type="text" required autocomplete="username">
+        </label>
+        <label class="field">
+          <span>Email</span>
+          <input id="email" name="email" type="email" autocomplete="email" placeholder="you@example.com">
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input id="password" name="password" type="password" required autocomplete="new-password">
+        </label>
+        <label class="field">
+          <span>Confirm password</span>
+          <input id="confirm" name="confirm" type="password" required autocomplete="new-password">
+        </label>
+        <button type="submit" class="primary">Create admin</button>
+      </form>
+    </section>
+  </main>
+  <script src="{{ url_for('static', filename='auth.js') }}"></script>
+</body>
+</html>
