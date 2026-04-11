@@ -29,7 +29,7 @@ from flask import (
 
 from .config import Settings
 from .nmchain_client import NmChainClient
-from .store import create_central_store_from_env
+from .store import ALLOWED_USER_ROLES, TEAM_MEMBERSHIP_STATUS_ACTIVE, TEAM_MEMBERSHIP_STATUS_PENDING, create_central_store_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -452,6 +452,188 @@ def _email_for_user(user: str) -> Optional[str]:
     return _store().users.get_email(user)
 
 
+def _groups_for_user(user: str) -> List[str]:
+    role = str(_role_for_user(user) or "").strip().lower()
+    return [role] if role else []
+
+
+def _team_store() -> Any:
+    return _store().teams
+
+
+def _team_memberships_for_user(user: str, *, statuses: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    cleaned = str(user or "").strip()
+    if not cleaned:
+        return []
+    return _team_store().list_user_memberships(cleaned, statuses=statuses)
+
+
+def _incoming_team_invitations_for_user(user: str) -> List[Dict[str, Any]]:
+    return _team_memberships_for_user(user, statuses=[TEAM_MEMBERSHIP_STATUS_PENDING])
+
+
+def _active_team_memberships_for_user(user: str) -> List[Dict[str, Any]]:
+    return _team_memberships_for_user(user, statuses=[TEAM_MEMBERSHIP_STATUS_ACTIVE])
+
+
+def _primary_team_for_user(user: str) -> Optional[Dict[str, Any]]:
+    memberships = _active_team_memberships_for_user(user)
+    return memberships[0] if memberships else None
+
+
+def _team_role_for_user(user: str, team_id: str) -> Optional[str]:
+    cleaned_user = str(user or "").strip()
+    cleaned_team = str(team_id or "").strip()
+    if not cleaned_user or not cleaned_team:
+        return None
+    return _team_store().team_role_for_user(cleaned_user, cleaned_team)
+
+
+def _is_admin_user(user: Optional[str]) -> bool:
+    cleaned = str(user or "").strip()
+    if not cleaned:
+        return False
+    return "admin" in _groups_for_user(cleaned)
+
+
+def _can_manage_team(user: Optional[str], team_id: Optional[str]) -> bool:
+    cleaned_user = str(user or "").strip()
+    cleaned_team = str(team_id or "").strip()
+    if not cleaned_user or not cleaned_team:
+        return False
+    if _is_admin_user(cleaned_user):
+        return True
+    return _team_role_for_user(cleaned_user, cleaned_team) == "owner"
+
+
+def _can_view_team(user: Optional[str], team_id: Optional[str]) -> bool:
+    cleaned_user = str(user or "").strip()
+    cleaned_team = str(team_id or "").strip()
+    if not cleaned_user or not cleaned_team:
+        return False
+    if _is_admin_user(cleaned_user):
+        return True
+    if _team_role_for_user(cleaned_user, cleaned_team):
+        return True
+    incoming = _incoming_team_invitations_for_user(cleaned_user)
+    if any(str(item.get("team_id") or "").strip() == cleaned_team for item in incoming):
+        return True
+    outgoing = _team_store().list_invitations_sent_by(cleaned_user, statuses=[TEAM_MEMBERSHIP_STATUS_PENDING])
+    return any(str(item.get("team_id") or "").strip() == cleaned_team for item in outgoing)
+
+
+def _user_identity_payload(user: str, *, include_directory: bool = False) -> Dict[str, Any]:
+    cleaned = str(user or "").strip()
+    role = _role_for_user(cleaned)
+    groups = _groups_for_user(cleaned)
+    email = _email_for_user(cleaned)
+    active_teams = _active_team_memberships_for_user(cleaned)
+    incoming_invitations = _incoming_team_invitations_for_user(cleaned)
+    payload: Dict[str, Any] = {
+        "user": cleaned,
+        "role": role,
+        "groups": groups,
+        "email": email,
+        "active_team": active_teams[0] if active_teams else None,
+        "team_count": len(active_teams),
+        "pending_invitation_count": len(incoming_invitations),
+        "is_admin": "admin" in groups,
+    }
+    if include_directory:
+        payload["teams"] = active_teams
+        payload["pending_invitations"] = incoming_invitations
+        payload["outgoing_invitations"] = _team_store().list_invitations_sent_by(
+            cleaned,
+            statuses=[TEAM_MEMBERSHIP_STATUS_PENDING],
+        )
+        user_entry = _store().users.get_user(cleaned) or {}
+        if "has_password" in user_entry:
+            payload["has_password"] = bool(user_entry.get("has_password"))
+        team_records = _visible_team_records_for_user(cleaned)
+        payload["team_tree"] = _build_team_tree(team_records, active_teams + incoming_invitations)
+    return payload
+
+
+def _visible_team_records_for_user(user: str) -> List[Dict[str, Any]]:
+    cleaned = str(user or "").strip()
+    all_teams = _team_store().list_teams()
+    if _is_admin_user(cleaned):
+        return all_teams
+    team_ids = set()
+    for membership in _active_team_memberships_for_user(cleaned) + _incoming_team_invitations_for_user(cleaned):
+        team_id = str(membership.get("team_id") or "").strip()
+        if team_id:
+            team_ids.add(team_id)
+    outgoing = _team_store().list_invitations_sent_by(cleaned, statuses=[TEAM_MEMBERSHIP_STATUS_PENDING])
+    for membership in outgoing:
+        team_id = str(membership.get("team_id") or "").strip()
+        if team_id:
+            team_ids.add(team_id)
+    teams_by_id = {str(item.get("id") or "").strip(): dict(item) for item in all_teams if item.get("id")}
+    pending = list(team_ids)
+    while pending:
+        current = pending.pop()
+        parent_id = str((teams_by_id.get(current) or {}).get("parent_id") or "").strip()
+        if parent_id and parent_id not in team_ids:
+            team_ids.add(parent_id)
+            pending.append(parent_id)
+    return [teams_by_id[team_id] for team_id in sorted(team_ids) if team_id in teams_by_id]
+
+
+def _build_team_tree(teams: List[Dict[str, Any]], memberships: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    teams_by_id: Dict[str, Dict[str, Any]] = {}
+    membership_map = {
+        str(item.get("team_id") or "").strip(): item
+        for item in memberships
+        if str(item.get("team_id") or "").strip()
+    }
+    for team in teams:
+        team_id = str(team.get("id") or "").strip()
+        if not team_id:
+            continue
+        node = dict(team)
+        node["children"] = []
+        membership = membership_map.get(team_id)
+        if membership:
+            node["membership_role"] = membership.get("membership_role")
+            node["membership_status"] = membership.get("status")
+        teams_by_id[team_id] = node
+    roots: List[Dict[str, Any]] = []
+    for node in sorted(teams_by_id.values(), key=lambda item: (str(item.get("name") or ""), str(item.get("id") or ""))):
+        parent_id = str(node.get("parent_id") or "").strip()
+        if parent_id and parent_id in teams_by_id:
+            teams_by_id[parent_id].setdefault("children", []).append(node)
+        else:
+            roots.append(node)
+    return roots
+
+
+def _validate_password_change_payload(payload: Dict[str, Any], *, require_current: bool) -> Tuple[Optional[Dict[str, str]], Optional[Tuple[Response, int]]]:
+    current_password = str(payload.get("current_password") or payload.get("password_current") or "")
+    new_password = str(payload.get("new_password") or payload.get("password") or "")
+    confirm_password = str(payload.get("confirm") or payload.get("confirm_password") or "")
+    if require_current and not current_password:
+        return None, (jsonify({"error": "current_password_required"}), 400)
+    if not new_password:
+        return None, (jsonify({"error": "password_required"}), 400)
+    if len(new_password) < _settings().password_min_length:
+        return None, (
+            jsonify(
+                {
+                    "error": "password_too_short",
+                    "details": f"Password must be at least {_settings().password_min_length} characters.",
+                }
+            ),
+            400,
+        )
+    if confirm_password and confirm_password != new_password:
+        return None, (jsonify({"error": "password_mismatch", "details": "Passwords do not match."}), 400)
+    return {
+        "current_password": current_password,
+        "new_password": new_password,
+    }, None
+
+
 def _record_identity_event(
     user: str,
     *,
@@ -465,6 +647,11 @@ def _record_identity_event(
     chain = _nmchain()
     if not chain:
         return
+    payload = _user_identity_payload(user)
+    details = dict(meta or {})
+    for key in ("groups", "active_team", "team_count", "pending_invitation_count"):
+        if key not in details and key in payload:
+            details[key] = payload.get(key)
     try:
         chain.upsert_identity(
             user,
@@ -473,7 +660,7 @@ def _record_identity_event(
             provider=provider,
             subject=subject,
             request_id=request_id,
-            meta=meta or {},
+            meta=details,
         )
     except Exception as exc:
         logger.warning("nmchain identity upsert failed for %s: %s", user, exc)
@@ -542,15 +729,14 @@ def _issue_access_token_payload(user: str, *, source: str) -> Dict[str, Any]:
 
 
 def _login_payload(user: str, *, source: str) -> Dict[str, Any]:
-    role = _role_for_user(user)
-    return {
+    payload = {
         "status": "ok",
-        "user": user,
-        "role": role,
         "sso_token": _issue_sso_token(user),
         "sso_expires_in": _settings().sso_ttl_seconds,
         **_issue_access_token_payload(user, source=source),
     }
+    payload.update(_user_identity_payload(user))
+    return payload
 
 
 def _finalize_login(
@@ -978,15 +1164,13 @@ def create_app() -> Flask:
         user = _current_user()
         if not user:
             return jsonify({"error": "unauthorized"}), 401
-        return jsonify(
-            {
-                "status": "ok",
-                "token": _issue_sso_token(user),
-                "expires_in": settings.sso_ttl_seconds,
-                "user": user,
-                "role": _role_for_user(user),
-            }
-        )
+        payload = {
+            "status": "ok",
+            "token": _issue_sso_token(user),
+            "expires_in": settings.sso_ttl_seconds,
+        }
+        payload.update(_user_identity_payload(user))
+        return jsonify(payload)
 
     @app.route("/api/logout", methods=["POST"])
     def api_logout() -> Response:
@@ -999,7 +1183,7 @@ def create_app() -> Flask:
         user = _current_user()
         if not user:
             return jsonify({"authenticated": False, "user": None}), 200
-        return jsonify({"authenticated": True, "user": user, "role": _role_for_user(user)})
+        return jsonify({"authenticated": True, **_user_identity_payload(user)})
 
     @app.route("/api/authz/nginx")
     def api_authz_nginx() -> Response:
@@ -1014,6 +1198,9 @@ def create_app() -> Flask:
         role = _role_for_user(user)
         if role:
             response.headers["X-Auth-Request-Role"] = role
+        active_team = _primary_team_for_user(user)
+        if active_team and active_team.get("team_id"):
+            response.headers["X-Auth-Request-Team"] = str(active_team.get("team_id") or "")
         return response
 
     @app.route("/api/profile", methods=["GET", "POST"])
@@ -1022,7 +1209,7 @@ def create_app() -> Flask:
         if not user:
             return jsonify({"error": "unauthorized"}), 401
         if request.method == "GET":
-            return jsonify({"user": user, "role": _role_for_user(user), "email": _email_for_user(user)})
+            return jsonify(_user_identity_payload(user, include_directory=True))
         payload = request.get_json(force=True, silent=True) or {}
         email = str(payload.get("email") or "").strip()
         if email and not EMAIL_RE.match(email):
@@ -1035,24 +1222,333 @@ def create_app() -> Flask:
             provider="profile",
             meta={"source": "api_profile"},
         )
-        return jsonify({"status": "ok", "email": _email_for_user(user)})
+        return jsonify({"status": "ok", **_user_identity_payload(user, include_directory=True)})
+
+    @app.route("/api/profile/password", methods=["POST"])
+    def api_profile_password() -> Response:
+        user = _current_user()
+        if not user:
+            return jsonify({"error": "unauthorized"}), 401
+        user_entry = _store().users.get_user(user) or {}
+        if not bool(user_entry.get("has_password")):
+            return jsonify({"error": "local_password_unavailable"}), 409
+        payload = request.get_json(force=True, silent=True) or {}
+        validated, error_response = _validate_password_change_payload(payload, require_current=True)
+        if error_response is not None:
+            return error_response
+        current_password = str((validated or {}).get("current_password") or "")
+        new_password = str((validated or {}).get("new_password") or "")
+        if not _store().users.verify(user, current_password):
+            return jsonify({"error": "invalid_current_password"}), 403
+        if not _store().users.set_password(user, new_password):
+            return jsonify({"error": "user_not_found"}), 404
+        _record_identity_event(
+            user,
+            role=_role_for_user(user),
+            email=_email_for_user(user),
+            provider="profile",
+            meta={"source": "api_profile_password", "password_changed": True},
+        )
+        return jsonify({"status": "ok"})
+
+    @app.route("/api/users", methods=["GET", "POST"])
+    def api_users() -> Response:
+        actor = _current_user()
+        if not actor:
+            return jsonify({"error": "unauthorized"}), 401
+        if not _is_admin_user(actor):
+            return jsonify({"error": "forbidden"}), 403
+        if request.method == "GET":
+            users_payload: List[Dict[str, Any]] = []
+            for entry in _store().users.list_users():
+                username = str(entry.get("username") or "").strip()
+                active_teams = _active_team_memberships_for_user(username)
+                pending_invitations = _incoming_team_invitations_for_user(username)
+                item = dict(entry)
+                item["active_team"] = active_teams[0] if active_teams else None
+                item["team_count"] = len(active_teams)
+                item["pending_invitation_count"] = len(pending_invitations)
+                users_payload.append(item)
+            return jsonify({"users": users_payload})
+        payload = request.get_json(force=True, silent=True) or {}
+        username = str(payload.get("username") or "").strip()
+        password = str(payload.get("password") or "")
+        confirm = str(payload.get("confirm") or payload.get("confirm_password") or "")
+        role = str(payload.get("role") or "user").strip().lower() or "user"
+        email_present = "email" in payload
+        email = str(payload.get("email") or "").strip()
+        if not username:
+            return jsonify({"error": "username_required"}), 400
+        if not USERNAME_RE.match(username):
+            return (
+                jsonify(
+                    {
+                        "error": "invalid_username",
+                        "details": "Username must be 3-32 chars (letters, numbers, underscore, dash).",
+                    }
+                ),
+                400,
+            )
+        if role not in ALLOWED_USER_ROLES:
+            return jsonify({"error": "invalid_role", "details": "Role must be one of admin, user."}), 400
+        if email and not EMAIL_RE.match(email):
+            return jsonify({"error": "invalid_email", "details": "Enter a valid email address."}), 400
+        if password and len(password) < settings.password_min_length:
+            return (
+                jsonify(
+                    {
+                        "error": "password_too_short",
+                        "details": f"Password must be at least {settings.password_min_length} characters.",
+                    }
+                ),
+                400,
+            )
+        if confirm and confirm != password:
+            return jsonify({"error": "password_mismatch", "details": "Passwords do not match."}), 400
+        existing = _store().users.get_user(username)
+        status_code = 200
+        if existing:
+            _store().users.ensure_user(username, role=role, email=existing.get("email"))
+            if email_present:
+                _store().users.set_email(username, email or None)
+            if password:
+                _store().users.set_password(username, password)
+        else:
+            if not password:
+                return jsonify({"error": "password_required"}), 400
+            _store().users.create_user(username, password, role=role, email=email or None)
+            status_code = 201
+        user_entry = _store().users.get_user(username) or {"username": username, "role": role, "email": email or None}
+        _record_identity_event(
+            username,
+            role=str(user_entry.get("role") or role),
+            email=str(user_entry.get("email") or "").strip() or None,
+            provider="admin",
+            meta={"source": "api_users", "actor": actor},
+        )
+        return jsonify({"status": "ok", "user_record": user_entry}), status_code
+
+    @app.route("/api/users/<username>/password", methods=["POST"])
+    def api_user_password(username: str) -> Response:
+        actor = _current_user()
+        if not actor:
+            return jsonify({"error": "unauthorized"}), 401
+        if not _is_admin_user(actor):
+            return jsonify({"error": "forbidden"}), 403
+        target = str(username or "").strip()
+        if not target:
+            return jsonify({"error": "username_required"}), 400
+        if not _store().users.get_user(target):
+            return jsonify({"error": "user_not_found"}), 404
+        payload = request.get_json(force=True, silent=True) or {}
+        validated, error_response = _validate_password_change_payload(payload, require_current=False)
+        if error_response is not None:
+            return error_response
+        new_password = str((validated or {}).get("new_password") or "")
+        if not _store().users.set_password(target, new_password):
+            return jsonify({"error": "user_not_found"}), 404
+        _record_identity_event(
+            target,
+            role=_role_for_user(target),
+            email=_email_for_user(target),
+            provider="admin",
+            meta={"source": "api_user_password", "actor": actor, "password_changed": True},
+        )
+        return jsonify({"status": "ok", "user": target})
+
+    @app.route("/api/teams", methods=["GET", "POST"])
+    def api_teams() -> Response:
+        user = _current_user()
+        if not user:
+            return jsonify({"error": "unauthorized"}), 401
+        if request.method == "GET":
+            memberships = _active_team_memberships_for_user(user)
+            incoming = _incoming_team_invitations_for_user(user)
+            outgoing = _team_store().list_invitations_sent_by(user, statuses=[TEAM_MEMBERSHIP_STATUS_PENDING])
+            teams_payload = _visible_team_records_for_user(user)
+            return jsonify(
+                {
+                    "teams": teams_payload,
+                    "tree": _build_team_tree(teams_payload, memberships + incoming),
+                    "memberships": memberships,
+                    "incoming_invitations": incoming,
+                    "outgoing_invitations": outgoing,
+                }
+            )
+        payload = request.get_json(force=True, silent=True) or {}
+        name = str(payload.get("name") or "").strip()
+        parent_id = str(payload.get("parent_id") or "").strip() or None
+        owner_username = str(payload.get("owner") or user).strip()
+        if not owner_username:
+            return jsonify({"error": "owner_required"}), 400
+        if not _is_admin_user(user) and owner_username != user:
+            return jsonify({"error": "forbidden"}), 403
+        if parent_id and not (_is_admin_user(user) or _can_manage_team(user, parent_id)):
+            return jsonify({"error": "forbidden"}), 403
+        try:
+            team = _team_store().create_team(name, owner_username=owner_username, parent_id=parent_id)
+        except ValueError as exc:
+            reason = str(exc)
+            if reason == "user_not_found":
+                return jsonify({"error": "user_not_found"}), 404
+            if reason == "parent_team_not_found":
+                return jsonify({"error": "parent_team_not_found"}), 404
+            if reason == "user_already_in_team":
+                return jsonify({"error": "user_already_in_team"}), 409
+            if reason == "owner_required":
+                return jsonify({"error": "owner_required"}), 400
+            raise
+        _record_identity_event(
+            owner_username,
+            role=_role_for_user(owner_username),
+            email=_email_for_user(owner_username),
+            provider="teams",
+            meta={"source": "api_teams_create", "team_id": team.get("id"), "actor": user},
+        )
+        return jsonify(team), 201
+
+    @app.route("/api/teams/<team_id>")
+    def api_team_detail(team_id: str) -> Response:
+        user = _current_user()
+        if not user:
+            return jsonify({"error": "unauthorized"}), 401
+        team = _team_store().get_team(team_id)
+        if not team:
+            return jsonify({"error": "team_not_found"}), 404
+        if not _can_view_team(user, team_id):
+            return jsonify({"error": "forbidden"}), 403
+        active_members = _team_store().list_team_members(team_id, statuses=[TEAM_MEMBERSHIP_STATUS_ACTIVE])
+        pending_members = _team_store().list_team_members(team_id, statuses=[TEAM_MEMBERSHIP_STATUS_PENDING])
+        return jsonify({"team": team, "members": active_members, "pending_invitations": pending_members})
+
+    @app.route("/api/teams/<team_id>/invite", methods=["POST"])
+    def api_team_invite(team_id: str) -> Response:
+        user = _current_user()
+        if not user:
+            return jsonify({"error": "unauthorized"}), 401
+        if not _can_manage_team(user, team_id):
+            return jsonify({"error": "forbidden"}), 403
+        payload = request.get_json(force=True, silent=True) or {}
+        target_username = str(payload.get("username") or payload.get("user") or "").strip()
+        if not target_username:
+            return jsonify({"error": "username_required"}), 400
+        try:
+            invitation = _team_store().invite_user(team_id, target_username, invited_by=user)
+        except ValueError as exc:
+            reason = str(exc)
+            if reason == "team_not_found":
+                return jsonify({"error": "team_not_found"}), 404
+            if reason == "user_not_found":
+                return jsonify({"error": "user_not_found"}), 404
+            if reason == "user_already_in_team":
+                return jsonify({"error": "user_already_in_team"}), 409
+            if reason == "username_required":
+                return jsonify({"error": "username_required"}), 400
+            raise
+        return jsonify(invitation), 201
+
+    @app.route("/api/team-invitations/<membership_id>/accept", methods=["POST"])
+    def api_team_invitation_accept(membership_id: str) -> Response:
+        user = _current_user()
+        if not user:
+            return jsonify({"error": "unauthorized"}), 401
+        invitation = _team_store().get_membership(membership_id)
+        if not invitation:
+            return jsonify({"error": "invitation_not_found"}), 404
+        target_user = str(invitation.get("username") or "").strip()
+        if target_user != user and not _is_admin_user(user):
+            return jsonify({"error": "forbidden"}), 403
+        try:
+            updated = _team_store().respond_to_invitation(membership_id, target_user, accept=True)
+        except ValueError as exc:
+            reason = str(exc)
+            if reason == "invitation_not_found":
+                return jsonify({"error": "invitation_not_found"}), 404
+            if reason == "invitation_not_pending":
+                return jsonify({"error": "invitation_not_pending"}), 409
+            if reason == "user_already_in_team":
+                return jsonify({"error": "user_already_in_team"}), 409
+            if reason == "invitation_not_owned":
+                return jsonify({"error": "forbidden"}), 403
+            raise
+        _record_identity_event(
+            target_user,
+            role=_role_for_user(target_user),
+            email=_email_for_user(target_user),
+            provider="teams",
+            meta={"source": "api_team_invitation_accept", "team_id": updated.get("team_id"), "actor": user},
+        )
+        return jsonify(updated)
+
+    @app.route("/api/team-invitations/<membership_id>/reject", methods=["POST"])
+    def api_team_invitation_reject(membership_id: str) -> Response:
+        user = _current_user()
+        if not user:
+            return jsonify({"error": "unauthorized"}), 401
+        invitation = _team_store().get_membership(membership_id)
+        if not invitation:
+            return jsonify({"error": "invitation_not_found"}), 404
+        target_user = str(invitation.get("username") or "").strip()
+        if target_user != user and not _is_admin_user(user):
+            return jsonify({"error": "forbidden"}), 403
+        try:
+            updated = _team_store().respond_to_invitation(membership_id, target_user, accept=False)
+        except ValueError as exc:
+            reason = str(exc)
+            if reason == "invitation_not_found":
+                return jsonify({"error": "invitation_not_found"}), 404
+            if reason == "invitation_not_pending":
+                return jsonify({"error": "invitation_not_pending"}), 409
+            if reason == "invitation_not_owned":
+                return jsonify({"error": "forbidden"}), 403
+            raise
+        _record_identity_event(
+            target_user,
+            role=_role_for_user(target_user),
+            email=_email_for_user(target_user),
+            provider="teams",
+            meta={"source": "api_team_invitation_reject", "team_id": updated.get("team_id"), "actor": user},
+        )
+        return jsonify(updated)
+
+    @app.route("/api/teams/<team_id>/leave", methods=["POST"])
+    def api_team_leave(team_id: str) -> Response:
+        user = _current_user()
+        if not user:
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            left = _team_store().leave_team(team_id, user)
+        except ValueError as exc:
+            if str(exc) == "team_owner_cannot_leave":
+                return jsonify({"error": "team_owner_cannot_leave"}), 409
+            raise
+        if not left:
+            return jsonify({"error": "membership_not_found"}), 404
+        _record_identity_event(
+            user,
+            role=_role_for_user(user),
+            email=_email_for_user(user),
+            provider="teams",
+            meta={"source": "api_team_leave", "team_id": team_id},
+        )
+        return jsonify({"status": "ok", "team_id": team_id})
 
     @app.route("/api/voice/tokens", methods=["GET", "POST"])
     def api_voice_tokens() -> Response:
         user = _current_user()
         if not user:
             return jsonify({"error": "unauthorized"}), 401
-        role = _role_for_user(user) or "user"
+        is_admin = _is_admin_user(user)
         if request.method == "GET":
             target = str(request.args.get("user") or "").strip() or None
-            if target and role != "admin":
+            if target and not is_admin:
                 return jsonify({"error": "forbidden"}), 403
-            if not target and role != "admin":
+            if not target and not is_admin:
                 target = user
             return jsonify({"tokens": store.voice_tokens.list_tokens(target)})
         payload = request.get_json(force=True, silent=True) or {}
         target = str(payload.get("user") or user).strip()
-        if target != user and role != "admin":
+        if target != user and not is_admin:
             return jsonify({"error": "forbidden"}), 403
         if store.users.has_users() and not _role_for_user(target):
             return jsonify({"error": "user_not_found"}), 404
@@ -1074,8 +1570,7 @@ def create_app() -> Flask:
         user = _current_user()
         if not user:
             return jsonify({"error": "unauthorized"}), 401
-        role = _role_for_user(user) or "user"
-        if role != "admin":
+        if not _is_admin_user(user):
             allowed_ids = {item.get("id") for item in store.voice_tokens.list_tokens(user)}
             if token_id not in allowed_ids:
                 return jsonify({"error": "forbidden"}), 403
@@ -1093,7 +1588,7 @@ def create_app() -> Flask:
         user = store.voice_tokens.verify(token)
         if not user:
             return jsonify({"authenticated": False, "user": None}), 404
-        return jsonify({"authenticated": True, "user": user, "role": _role_for_user(user)})
+        return jsonify({"authenticated": True, **_user_identity_payload(user)})
 
     @app.route("/api/internal/credentials/verify", methods=["POST"])
     @require_app_token
@@ -1104,14 +1599,9 @@ def create_app() -> Flask:
         if not username or not password:
             return jsonify({"error": "username_and_password_required"}), 400
         valid = store.users.verify(username, password)
-        return jsonify(
-            {
-                "authenticated": bool(valid),
-                "user": username if valid else None,
-                "role": _role_for_user(username) if valid else None,
-                "email": _email_for_user(username) if valid else None,
-            }
-        )
+        if not valid:
+            return jsonify({"authenticated": False, "user": None, "role": None, "email": None})
+        return jsonify({"authenticated": True, **_user_identity_payload(username)})
 
     return app
 

@@ -45,11 +45,15 @@ Service interactions:
 Customers owns:
 
 - first-user bootstrap and local account creation
+- admin-managed local user creation and password resets
 - password verification and login throttling
+- self-service password changes
 - browser session cookies
 - SSO token issue/exchange
 - OIDC login and callback handling
 - user profile reads and updates
+- hierarchical team ownership and membership metadata
+- team invitations, acceptance/rejection, and leaving a team
 - voice-token issue, list, revoke, and internal resolution
 
 Customers does not own:
@@ -57,6 +61,23 @@ Customers does not own:
 - job execution
 - token balances or payment settlement
 - speech recognition
+
+## Team model
+
+Customers keeps the top-level identity role model intentionally small:
+
+- `admin`
+- `user`
+
+Team collaboration is tracked separately from those global roles:
+
+- a user can create a team they own
+- admins can create nested teams through `parent_id`
+- a team owner can invite another existing user into that team
+- the invitee can accept or reject the invitation
+- an active team member can later leave the team and still keep their individual user account
+
+Session, profile, and internal credential responses now include additive team/group context so downstream services can consume it without a second identity lookup.
 
 ## API surface
 
@@ -78,6 +99,15 @@ Public JSON routes:
 - `POST /api/logout`
 - `GET /api/session`
 - `GET|POST /api/profile`
+- `POST /api/profile/password`
+- `GET|POST /api/users`
+- `POST /api/users/<username>/password`
+- `GET|POST /api/teams`
+- `GET /api/teams/<team_id>`
+- `POST /api/teams/<team_id>/invite`
+- `POST /api/teams/<team_id>/leave`
+- `POST /api/team-invitations/<invitation_id>/accept`
+- `POST /api/team-invitations/<invitation_id>/reject`
 - `POST /api/sso/issue`
 - `POST /api/oidc/exchange`
 - `GET /api/authz/nginx`
@@ -107,6 +137,8 @@ That keeps user/session/voice-token records in the cluster relational store rath
 Relevant tables created in Postgres include:
 
 - `nm_users`
+- `nm_teams`
+- `nm_team_memberships`
 - `nm_auth_tokens`
 - `nm_token_accounts`
 - `nm_token_ledger_entries`
