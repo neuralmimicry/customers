@@ -99,6 +99,30 @@ def test_setup_creates_session_and_supports_internal_identity_routes(monkeypatch
     assert resolve_payload["user"] == "alice"
     assert resolve_payload["groups"] == ["admin"]
 
+    lookup_response = client.get(
+        "/api/internal/users/alice",
+        headers={"Authorization": "Bearer test-billing-token"},
+    )
+    assert lookup_response.status_code == 200
+    lookup_payload = lookup_response.get_json()
+    assert lookup_payload["authenticated"] is True
+    assert lookup_payload["user"] == "alice"
+    assert lookup_payload["user_record"]["username"] == "alice"
+
+
+def test_internal_user_lookup_returns_404_for_missing_user(monkeypatch, tmp_path):
+    app = _build_app(monkeypatch, tmp_path)
+    client = app.test_client()
+    _setup_admin(client)
+
+    response = client.get(
+        "/api/internal/users/unknown",
+        headers={"Authorization": "Bearer test-billing-token"},
+    )
+
+    assert response.status_code == 404
+    assert response.get_json()["error"] == "user_not_found"
+
 
 def test_admin_can_manage_users_and_reset_passwords(monkeypatch, tmp_path):
     app = _build_app(monkeypatch, tmp_path)

@@ -1590,6 +1590,17 @@ def create_app() -> Flask:
             return jsonify({"authenticated": False, "user": None}), 404
         return jsonify({"authenticated": True, **_user_identity_payload(user)})
 
+    @app.route("/api/internal/users/<username>", methods=["GET"])
+    @require_app_token
+    def api_internal_user_lookup(username: str) -> Response:
+        cleaned = str(username or "").strip()
+        if not cleaned:
+            return jsonify({"error": "username_required"}), 400
+        user_entry = store.users.get_user(cleaned)
+        if not user_entry:
+            return jsonify({"error": "user_not_found"}), 404
+        return jsonify({"authenticated": True, "user_record": user_entry, **_user_identity_payload(cleaned)})
+
     @app.route("/api/internal/credentials/verify", methods=["POST"])
     @require_app_token
     def api_internal_credentials_verify() -> Response:

@@ -1573,6 +1573,43 @@ class PostgresTokenLedger:
                         new_free += requested_delta
                     else:
                         requested_delta = 0
+                elif kind == "transfer_in":
+                    if requested_delta <= 0:
+                        requested_delta = abs(requested_delta)
+                    desired = abs(requested_delta)
+                    free_tokens = max(0, int(meta_dict.get("free_tokens") or meta_dict.get("free_used") or 0))
+                    free_tokens = min(free_tokens, desired)
+                    paid_tokens = max(0, int(meta_dict.get("paid_tokens") or meta_dict.get("paid_used") or (desired - free_tokens)))
+                    paid_tokens = min(paid_tokens, desired - free_tokens)
+                    paid_tokens += desired - free_tokens - paid_tokens
+                    new_free += free_tokens
+                    new_paid += paid_tokens
+                    requested_delta = free_tokens + paid_tokens
+                    meta_dict["free_used"] = free_tokens
+                    meta_dict["paid_used"] = paid_tokens
+                    meta_dict["used_total"] = requested_delta
+                elif kind == "transfer_out":
+                    if requested_delta >= 0:
+                        requested_delta = -abs(requested_delta or 0)
+                    desired = abs(requested_delta)
+                    available = max(0, balance - int(summary.get("reserved") or 0))
+                    if desired > available:
+                        shortfall = desired
+                        meta_dict["shortfall"] = shortfall
+                        meta_dict["free_used"] = 0
+                        meta_dict["paid_used"] = 0
+                        meta_dict["used_total"] = 0
+                        requested_delta = 0
+                    else:
+                        free_used = min(new_free, desired)
+                        new_free -= free_used
+                        remaining = desired - free_used
+                        paid_used = min(new_paid, remaining)
+                        new_paid -= paid_used
+                        meta_dict["free_used"] = free_used
+                        meta_dict["paid_used"] = paid_used
+                        meta_dict["used_total"] = free_used + paid_used
+                        requested_delta = -(free_used + paid_used)
                 elif kind == "cashout":
                     if requested_delta >= 0:
                         requested_delta = -abs(requested_delta)

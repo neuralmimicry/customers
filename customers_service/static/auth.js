@@ -32,6 +32,16 @@
     return `${apiBase}${suffix}`;
   };
 
+  const redirectViaSso = (token) => {
+    const cleaned = String(token || '').trim();
+    if (!cleaned) return false;
+    const ssoUrl = new URL(apiUrl('/sso') || '/sso', window.location.href);
+    ssoUrl.searchParams.set('token', cleaned);
+    ssoUrl.searchParams.set('next', nextPath);
+    window.location.href = ssoUrl.toString();
+    return true;
+  };
+
   const setError = (message) => {
     if (!errorEl) return;
     errorEl.textContent = message || '';
@@ -93,6 +103,9 @@
           return;
         }
         setError(errorMessage(data));
+        return;
+      }
+      if (redirectViaSso(data?.sso_token || data?.token)) {
         return;
       }
       window.location.href = nextPath;
