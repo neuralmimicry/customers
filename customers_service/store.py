@@ -618,6 +618,36 @@ class PostgresUserStore:
         value = (row or {}).get("role")
         return str(value).strip() if value else None
 
+    def get_metadata(self, username: str) -> Dict[str, Any]:
+        username = str(username or "").strip()
+        if not username:
+            return {}
+        with self.store.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT metadata FROM nm_users WHERE username = %s",
+                (username,),
+            ).fetchone()
+        metadata = (row or {}).get("metadata")
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def set_metadata(self, username: str, metadata: Optional[Dict[str, Any]]) -> bool:
+        username = str(username or "").strip()
+        if not username:
+            return False
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    UPDATE nm_users
+                    SET metadata = %s,
+                        updated_at = NOW()
+                    WHERE username = %s
+                    RETURNING username
+                    """,
+                    (_jsonb(dict(metadata or {})), username),
+                ).fetchone()
+        return bool(row)
+
     def set_password(self, username: str, password: str) -> bool:
         username = str(username or "").strip()
         if not username:
@@ -1920,6 +1950,28 @@ class FileUserStore:
             entry = self.data.get(str(username or "").strip()) or {}
             value = entry.get("role")
         return str(value).strip() if value else None
+
+    def get_metadata(self, username: str) -> Dict[str, Any]:
+        cleaned = str(username or "").strip()
+        if not cleaned:
+            return {}
+        with self.lock:
+            entry = self.data.get(cleaned) or {}
+            metadata = entry.get("metadata")
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def set_metadata(self, username: str, metadata: Optional[Dict[str, Any]]) -> bool:
+        cleaned = str(username or "").strip()
+        if not cleaned:
+            return False
+        with self.lock:
+            entry = self.data.get(cleaned)
+            if not isinstance(entry, dict):
+                return False
+            entry["metadata"] = dict(metadata or {})
+            entry["updated_at"] = _timestamp(dt.datetime.now(UTC))
+            self._write()
+            return True
 
     def set_password(self, username: str, password: str) -> bool:
         cleaned = str(username or "").strip()

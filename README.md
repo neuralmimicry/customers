@@ -78,6 +78,7 @@ Team collaboration is tracked separately from those global roles:
 - an active team member can later leave the team and still keep their individual user account
 
 Session, profile, and internal credential responses now include additive team/group context so downstream services can consume it without a second identity lookup.
+Profile and session responses also carry the validated `settings` block used by Refiner's Control Room so the public contract stays stable when auth/profile routes are proxied through Customers.
 
 ## API surface
 
@@ -133,6 +134,7 @@ The production default in the Continuum deployment is the shared tenant Postgres
 - database: `continuum` by default unless overridden through the shared auth host vars
 
 That keeps user/session/voice-token records in the cluster relational store rather than per-pod local files.
+The same user metadata record now also holds validated profile settings defaults, so Refiner and Customers can share one source of truth for profile-backed LLM, assistant, solver, and UI preferences.
 
 Relevant tables created in Postgres include:
 

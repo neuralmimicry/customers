@@ -30,6 +30,13 @@ from flask import (
 from .config import Settings
 from .nmchain_client import NmChainClient
 from .store import ALLOWED_USER_ROLES, TEAM_MEMBERSHIP_STATUS_ACTIVE, TEAM_MEMBERSHIP_STATUS_PENDING, create_central_store_from_env
+from .profile_settings import (
+    SettingsValidationError,
+    default_settings as default_user_settings,
+    metadata_with_settings,
+    settings_from_metadata,
+    validate_settings_patch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +84,10 @@ def _current_app_actor() -> Optional[str]:
         if secrets.compare_digest(token, value):
             return app_id
     return None
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def require_app_token(view: Callable[..., Response]) -> Callable[..., Response]:
@@ -522,6 +533,37 @@ def _can_view_team(user: Optional[str], team_id: Optional[str]) -> bool:
     return any(str(item.get("team_id") or "").strip() == cleaned_team for item in outgoing)
 
 
+def _user_metadata(user: Optional[str]) -> Dict[str, Any]:
+    cleaned = str(user or "").strip()
+    if not cleaned:
+        return {}
+    try:
+        metadata = _store().users.get_metadata(cleaned)
+    except Exception:
+        metadata = {}
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _user_settings(user: Optional[str]) -> Dict[str, Any]:
+    cleaned = str(user or "").strip()
+    if not cleaned:
+        return default_user_settings()
+    return settings_from_metadata(_user_metadata(cleaned))
+
+
+def _update_user_settings(user: str, raw_settings: Any) -> Dict[str, Any]:
+    cleaned = str(user or "").strip()
+    if not cleaned:
+        raise SettingsValidationError(["user is required"])
+    current_metadata = _user_metadata(cleaned)
+    current_settings = settings_from_metadata(current_metadata)
+    merged = validate_settings_patch(raw_settings, current=current_settings)
+    updated_metadata = metadata_with_settings(current_metadata, merged, updated_at=_now_iso())
+    if not _store().users.set_metadata(cleaned, updated_metadata):
+        raise KeyError(cleaned)
+    return merged
+
+
 def _user_identity_payload(user: str, *, include_directory: bool = False) -> Dict[str, Any]:
     cleaned = str(user or "").strip()
     role = _role_for_user(cleaned)
@@ -530,6 +572,7 @@ def _user_identity_payload(user: str, *, include_directory: bool = False) -> Dic
     active_teams = _active_team_memberships_for_user(cleaned)
     incoming_invitations = _incoming_team_invitations_for_user(cleaned)
     payload: Dict[str, Any] = {
+        "authenticated": True,
         "user": cleaned,
         "role": role,
         "groups": groups,
@@ -538,6 +581,7 @@ def _user_identity_payload(user: str, *, include_directory: bool = False) -> Dic
         "team_count": len(active_teams),
         "pending_invitation_count": len(incoming_invitations),
         "is_admin": "admin" in groups,
+        "settings": _user_settings(cleaned),
     }
     if include_directory:
         payload["teams"] = active_teams
@@ -1211,16 +1255,26 @@ def create_app() -> Flask:
         if request.method == "GET":
             return jsonify(_user_identity_payload(user, include_directory=True))
         payload = request.get_json(force=True, silent=True) or {}
-        email = str(payload.get("email") or "").strip()
-        if email and not EMAIL_RE.match(email):
-            return jsonify({"error": "invalid_email", "details": "Enter a valid email address."}), 400
-        store.users.set_email(user, email or None)
+        email = None
+        if "email" in payload:
+            email = str(payload.get("email") or "").strip()
+            if email and not EMAIL_RE.match(email):
+                return jsonify({"error": "invalid_email", "details": "Enter a valid email address."}), 400
+        if "settings" in payload:
+            try:
+                _update_user_settings(user, payload.get("settings"))
+            except SettingsValidationError as exc:
+                return jsonify({"error": "invalid_settings", "details": exc.issues}), 400
+            except KeyError:
+                return jsonify({"error": "user_not_found"}), 404
+        if "email" in payload:
+            store.users.set_email(user, email or None)
         _record_identity_event(
             user,
             role=_role_for_user(user),
             email=_email_for_user(user),
             provider="profile",
-            meta={"source": "api_profile"},
+            meta={"source": "api_profile", "settings_updated": "settings" in payload},
         )
         return jsonify({"status": "ok", **_user_identity_payload(user, include_directory=True)})
 

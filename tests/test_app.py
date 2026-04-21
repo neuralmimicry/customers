@@ -303,3 +303,46 @@ def test_user_can_reject_invite_and_change_own_password(monkeypatch, tmp_path):
 
     dave_new_password_client = app.test_client()
     assert _login(dave_new_password_client, "dave", "dave replacement password 456").status_code == 200
+
+
+def test_profile_settings_roundtrip_preserves_email(monkeypatch, tmp_path):
+    app = _build_app(monkeypatch, tmp_path)
+    client = app.test_client()
+    _setup_admin(client)
+
+    profile_response = client.get("/api/profile")
+    assert profile_response.status_code == 200
+    profile_payload = profile_response.get_json()
+    assert profile_payload["authenticated"] is True
+    assert profile_payload["email"] == "alice@example.com"
+    assert profile_payload["settings"]["assistant"]["use_memory"] is True
+
+    update_response = client.post(
+        "/api/profile",
+        json={
+            "settings": {
+                "assistant": {"use_memory": False},
+                "solver": {"command_policy_mode": "strict"},
+            }
+        },
+    )
+    assert update_response.status_code == 200
+    update_payload = update_response.get_json()
+    assert update_payload["email"] == "alice@example.com"
+    assert update_payload["settings"]["assistant"]["use_memory"] is False
+    assert update_payload["settings"]["solver"]["command_policy_mode"] == "strict"
+
+    session_response = client.get("/api/session")
+    assert session_response.status_code == 200
+    session_payload = session_response.get_json()
+    assert session_payload["settings"]["assistant"]["use_memory"] is False
+    assert session_payload["settings"]["solver"]["command_policy_mode"] == "strict"
+
+    invalid_response = client.post(
+        "/api/profile",
+        json={"settings": {"solver": {"command_policy_mode": "invalid"}}},
+    )
+    assert invalid_response.status_code == 400
+    invalid_payload = invalid_response.get_json()
+    assert invalid_payload["error"] == "invalid_settings"
+    assert invalid_payload["details"]
