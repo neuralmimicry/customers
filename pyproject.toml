@@ -25,3 +25,10 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["customers_service*"]
+
+[tool.setuptools.package-data]
+customers_service = [
+  "templates/*.html",
+  "static/*.css",
+  "static/*.js",
+]
