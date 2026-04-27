@@ -207,6 +207,23 @@ def _safe_external_redirect(value: Optional[str]) -> str:
     return "/"
 
 
+def _payload_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _parse_kv_params(raw: str) -> Dict[str, str]:
     params: Dict[str, str] = {}
     for chunk in (raw or "").split(","):
@@ -812,6 +829,68 @@ def _finalize_login(
     )
 
 
+def _auth_config_payload() -> Dict[str, Any]:
+    settings = _settings()
+    has_users = _store().users.has_users()
+    local_auth_available = settings.auth_mode != "oidc"
+    setup_available = local_auth_available and settings.allow_setup and not has_users
+    self_registration_available = local_auth_available and settings.self_registration_enabled and has_users
+    return {
+        "service": settings.service_name,
+        "auth_mode": settings.auth_mode,
+        "oidc_enabled": settings.oidc_enabled,
+        "oidc_button_label": settings.oidc_button_label,
+        "password_min_length": settings.password_min_length,
+        "has_users": has_users,
+        "setup_allowed": bool(settings.allow_setup),
+        "setup_available": setup_available,
+        "local_login_enabled": local_auth_available and has_users,
+        "self_registration_enabled": self_registration_available,
+        "team_provisioning_available": True,
+    }
+
+
+def _maybe_provision_workspace(user: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    workspace_name = str(
+        payload.get("workspace_name")
+        or payload.get("team_name")
+        or payload.get("workspace")
+        or ""
+    ).strip()
+    create_team_explicit = any(key in payload for key in ("create_team", "create_workspace"))
+    create_team = _payload_bool(
+        payload.get("create_team") if "create_team" in payload else payload.get("create_workspace"),
+        default=False,
+    )
+    if not workspace_name and not create_team:
+        return None
+    if not create_team and workspace_name and not create_team_explicit:
+        create_team = True
+    if not create_team:
+        return None
+    try:
+        team = _team_store().create_team(
+            workspace_name or f"{user} workspace",
+            owner_username=user,
+        )
+        return {
+            "workspace_provisioned": True,
+            "workspace": team,
+        }
+    except ValueError as exc:
+        logger.warning("workspace provision skipped for %s: %s", user, exc)
+        return {
+            "workspace_provisioned": False,
+            "workspace_error": str(exc),
+        }
+    except Exception as exc:
+        logger.warning("workspace provision failed for %s: %s", user, exc)
+        return {
+            "workspace_provisioned": False,
+            "workspace_error": "workspace_create_failed",
+        }
+
+
 def create_app() -> Flask:
     settings = Settings.from_env()
     if settings.oidc_enabled and settings.oidc_require_config:
@@ -857,6 +936,7 @@ def create_app() -> Flask:
 
     @app.route("/api/health")
     def api_health() -> Response:
+        auth_config = _auth_config_payload()
         return jsonify(
             {
                 "status": "ok",
@@ -866,6 +946,11 @@ def create_app() -> Flask:
                 "auth_mode": settings.auth_mode,
                 "oidc_enabled": settings.oidc_enabled,
                 "allow_setup": settings.allow_setup,
+                "has_users": auth_config["has_users"],
+                "setup_available": auth_config["setup_available"],
+                "self_registration_enabled": auth_config["self_registration_enabled"],
+                "oidc_button_label": settings.oidc_button_label,
+                "team_provisioning_available": auth_config["team_provisioning_available"],
                 "nmchain_enabled": bool(_nmchain()),
                 "app_tokens_configured": sorted(settings.app_tokens.keys()),
             }
@@ -874,6 +959,10 @@ def create_app() -> Flask:
     @app.route("/api/version")
     def api_version() -> Response:
         return jsonify({"service": settings.service_name, "version": settings.version})
+
+    @app.route("/api/auth/config")
+    def api_auth_config() -> Response:
+        return jsonify(_auth_config_payload())
 
     @app.route("/login", methods=["GET", "POST"])
     def login() -> Response:
@@ -1100,6 +1189,7 @@ def create_app() -> Flask:
         if email and not EMAIL_RE.match(email):
             return jsonify({"error": "invalid_email", "details": "Enter a valid email address."}), 400
         store.users.create_user(username, password, role="admin", email=email or None)
+        workspace_payload = _maybe_provision_workspace(username, payload)
         _finalize_login(
             username,
             auth_mode="setup",
@@ -1108,13 +1198,74 @@ def create_app() -> Flask:
             role="admin",
             email=email or None,
         )
-        return jsonify(_login_payload(username, source=source)), 201
+        response_payload = _login_payload(username, source=source)
+        if workspace_payload:
+            response_payload.update(workspace_payload)
+        return jsonify(response_payload), 201
 
     @app.route("/api/setup", methods=["POST"])
     def api_setup() -> Response:
         payload = request.get_json(force=True, silent=True) or {}
         response, status = _handle_setup_payload(payload, source="api_setup")
         return response, status
+
+    @app.route("/api/register", methods=["POST"])
+    def api_register() -> Response:
+        if settings.auth_mode == "oidc":
+            return jsonify({"error": "oidc_required"}), 403
+        if not settings.self_registration_enabled:
+            return jsonify({"error": "registration_not_allowed"}), 403
+        if not store.users.has_users():
+            return jsonify({"error": "setup_required"}), 400
+        payload = request.get_json(force=True, silent=True) or {}
+        username = str(payload.get("username") or "").strip()
+        email = str(payload.get("email") or "").strip()
+        password = str(payload.get("password") or "")
+        confirm = str(payload.get("confirm") or "")
+        if not email:
+            return jsonify({"error": "email_required", "details": "Email is required."}), 400
+        if not username or not password:
+            return jsonify({"error": "username_and_password_required"}), 400
+        if not USERNAME_RE.match(username):
+            return (
+                jsonify(
+                    {
+                        "error": "invalid_username",
+                        "details": "Username must be 3-32 chars (letters, numbers, underscore, dash).",
+                    }
+                ),
+                400,
+            )
+        if not EMAIL_RE.match(email):
+            return jsonify({"error": "invalid_email", "details": "Enter a valid email address."}), 400
+        if len(password) < settings.password_min_length:
+            return (
+                jsonify(
+                    {
+                        "error": "password_too_short",
+                        "details": f"Password must be at least {settings.password_min_length} characters.",
+                    }
+                ),
+                400,
+            )
+        if confirm and password != confirm:
+            return jsonify({"error": "password_mismatch", "details": "Passwords do not match."}), 400
+        if store.users.get_user(username):
+            return jsonify({"error": "user_exists", "details": "That username is already in use."}), 409
+        store.users.create_user(username, password, role="user", email=email)
+        workspace_payload = _maybe_provision_workspace(username, payload)
+        _finalize_login(
+            username,
+            auth_mode="register",
+            provider="register",
+            source="api_register",
+            role="user",
+            email=email,
+        )
+        response_payload = _login_payload(username, source="api_register")
+        if workspace_payload:
+            response_payload.update(workspace_payload)
+        return jsonify(response_payload), 201
 
     @app.route("/api/login", methods=["POST"])
     def api_login() -> Response:

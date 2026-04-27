@@ -95,7 +95,9 @@ Public JSON routes:
 
 - `GET /api/health`
 - `GET /api/version`
+- `GET /api/auth/config`
 - `POST /api/setup`
+- `POST /api/register`
 - `POST /api/login`
 - `POST /api/logout`
 - `GET /api/session`
@@ -170,6 +172,7 @@ Core runtime variables:
 - `CUSTOMERS_AUTH_MODE` = `local`, `oidc`, or `mixed`
 - `CUSTOMERS_PASSWORD_MIN_LENGTH`
 - `CUSTOMERS_ALLOW_SETUP`
+- `CUSTOMERS_SELF_REGISTRATION_ENABLED`
 - `CUSTOMERS_SESSION_COOKIE_NAME`
 - `CUSTOMERS_COOKIE_DOMAIN`
 - `CUSTOMERS_COOKIE_SAMESITE`

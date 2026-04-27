@@ -3,11 +3,12 @@ from __future__ import annotations
 from customers_service.app import create_app
 
 
-def _build_app(monkeypatch, tmp_path):
+def _build_app(monkeypatch, tmp_path, *, self_registration=False):
     monkeypatch.setenv("CUSTOMERS_SECRET_KEY", "test-secret-key")
     monkeypatch.setenv("CUSTOMERS_APP_TOKENS", "refiner=test-refiner-token,billing=test-billing-token")
     monkeypatch.setenv("CUSTOMERS_STATE_DIR", str(tmp_path / "customers-state"))
     monkeypatch.setenv("CUSTOMERS_ALLOW_SETUP", "1")
+    monkeypatch.setenv("CUSTOMERS_SELF_REGISTRATION_ENABLED", "1" if self_registration else "0")
     monkeypatch.setenv("CUSTOMERS_SECURE_COOKIES", "0")
     monkeypatch.setenv("CUSTOMERS_ENFORCE_HTTPS", "0")
     return create_app()
@@ -56,7 +57,64 @@ def test_health_reports_service_state(monkeypatch, tmp_path):
     payload = response.get_json()
     assert payload["status"] == "ok"
     assert payload["service"] == "customers"
+    assert payload["has_users"] is False
+    assert payload["setup_available"] is True
+    assert payload["self_registration_enabled"] is False
     assert sorted(payload["app_tokens_configured"]) == ["billing", "refiner"]
+
+
+def test_auth_config_and_self_registration_create_workspace(monkeypatch, tmp_path):
+    app = _build_app(monkeypatch, tmp_path, self_registration=True)
+    setup_client = app.test_client()
+
+    pre_setup_response = setup_client.get("/api/auth/config")
+    assert pre_setup_response.status_code == 200
+    pre_setup_payload = pre_setup_response.get_json()
+    assert pre_setup_payload["has_users"] is False
+    assert pre_setup_payload["setup_available"] is True
+    assert pre_setup_payload["self_registration_enabled"] is False
+    assert pre_setup_payload["team_provisioning_available"] is True
+
+    _setup_admin(setup_client)
+
+    auth_config_response = app.test_client().get("/api/auth/config")
+    assert auth_config_response.status_code == 200
+    auth_config_payload = auth_config_response.get_json()
+    assert auth_config_payload["has_users"] is True
+    assert auth_config_payload["local_login_enabled"] is True
+    assert auth_config_payload["self_registration_enabled"] is True
+
+    register_client = app.test_client()
+    register_response = register_client.post(
+        "/api/register",
+        json={
+            "username": "bob",
+            "email": "bob@example.com",
+            "password": "bob password 123",
+            "confirm": "bob password 123",
+            "create_team": True,
+            "workspace_name": "Bob Workspace",
+        },
+    )
+    assert register_response.status_code == 201
+    register_payload = register_response.get_json()
+    assert register_payload["user"] == "bob"
+    assert register_payload["role"] == "user"
+    assert register_payload["workspace_provisioned"] is True
+    assert register_payload["active_team"]["team_name"] == "Bob Workspace"
+    assert register_payload["team_count"] == 1
+
+    session_response = register_client.get("/api/session")
+    assert session_response.status_code == 200
+    session_payload = session_response.get_json()
+    assert session_payload["authenticated"] is True
+    assert session_payload["user"] == "bob"
+    assert session_payload["active_team"]["team_name"] == "Bob Workspace"
+
+    relogin_client = app.test_client()
+    relogin_response = _login(relogin_client, "bob", "bob password 123")
+    assert relogin_response.status_code == 200
+    assert relogin_response.get_json()["active_team"]["team_name"] == "Bob Workspace"
 
 
 def test_setup_creates_session_and_supports_internal_identity_routes(monkeypatch, tmp_path):

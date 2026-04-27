@@ -107,6 +107,7 @@ class Settings:
     sso_redis_prefix: str
     app_tokens: Dict[str, str]
     allow_setup: bool
+    self_registration_enabled: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -189,4 +190,5 @@ class Settings:
             sso_redis_prefix=env_first("CUSTOMERS_SSO_REDIS_PREFIX", default="customers:sso:"),
             app_tokens=parse_app_tokens(env_first("CUSTOMERS_APP_TOKENS", default="")),
             allow_setup=env_bool("CUSTOMERS_ALLOW_SETUP", default=True),
+            self_registration_enabled=env_bool("CUSTOMERS_SELF_REGISTRATION_ENABLED", default=False),
         )
