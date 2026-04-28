@@ -14,7 +14,9 @@ dependencies = [
   "psycopg[binary]>=3.2,<4",
   "psycopg-pool>=3.2,<4",
   "redis>=5.0,<6",
-  "cryptography>=42,<46",
+  "cryptography>=42,<48",
+  "pyotp>=2.9,<3",
+  "webauthn>=2.7,<3",
   "Werkzeug>=3.0,<4",
 ]
 

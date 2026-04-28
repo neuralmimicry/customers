@@ -117,6 +117,105 @@ input:focus {
   filter: brightness(1.04);
 }
 
+.secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 3rem;
+  border: 1px solid rgba(32, 25, 18, 0.16);
+  border-radius: 999px;
+  padding: 0.9rem 1.2rem;
+  font: inherit;
+  font-weight: 700;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.78);
+  cursor: pointer;
+}
+
+.secondary:hover {
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.button-row {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.auth-step {
+  display: grid;
+  gap: 1rem;
+}
+
+.security-options,
+.security-setup,
+.security-panel {
+  margin: 0;
+  border: 1px solid rgba(32, 25, 18, 0.12);
+  border-radius: 1rem;
+  padding: 1rem;
+  background: rgba(255, 255, 255, 0.66);
+}
+
+.security-options {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.security-options legend,
+.panel-title {
+  padding: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.choice {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+  font-weight: 600;
+}
+
+.choice input {
+  width: auto;
+  margin: 0.2rem 0 0;
+}
+
+.security-setup {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1.4rem;
+}
+
+.security-panel {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.security-copy {
+  margin-top: 0;
+}
+
+.auth-footnote {
+  margin-top: 1.25rem;
+}
+
+.inline-link {
+  color: var(--accent-strong);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.inline-link:hover {
+  text-decoration: underline;
+}
+
+.mono {
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.9rem;
+}
+
 .auth-divider {
   display: grid;
   grid-template-columns: 1fr auto 1fr;
@@ -141,6 +240,16 @@ input:focus {
   background: rgba(180, 35, 24, 0.08);
 }
 
+input[readonly] {
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--muted);
+}
+
+button[disabled] {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
 @media (max-width: 640px) {
   .shell {
     padding: 1rem;
@@ -149,5 +258,9 @@ input:focus {
   .card {
     padding: 1.35rem;
     border-radius: 1.2rem;
+  }
+
+  .button-row {
+    grid-template-columns: 1fr;
   }
 }

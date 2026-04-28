@@ -4,19 +4,19 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="rag-api-base" content="{{ api_base or '' }}">
-  <title>NeuralMimicry Customers Setup</title>
+  <title>NeuralMimicry Customers Register</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
   <main class="shell">
     <section class="card auth-card">
       <p class="eyebrow">NeuralMimicry Customers</p>
-      <h1>Create the first administrator</h1>
-      <p class="subtitle">This boots the shared identity service used across Refiner, billing, and backend service integrations.</p>
+      <h1>Create an account</h1>
+      <p class="subtitle">Create your NeuralMimicry account, then add optional sign-in security before continuing to your granted services.</p>
       <p id="authError" class="auth-error" {% if not error %}hidden{% endif %}>{{ error }}</p>
       <form
         id="authForm"
-        data-auth="setup"
+        data-auth="register"
         data-next="{{ next_path or '/' }}"
         data-password-min-length="{{ password_min_length }}"
         data-passkeys-supported="{{ 'true' if passkeys_supported else 'false' }}"
@@ -24,12 +24,12 @@
         class="auth-form"
       >
         <label class="field">
-          <span>Administrator username</span>
+          <span>Username</span>
           <input id="username" name="username" type="text" required autocomplete="username">
         </label>
         <label class="field">
           <span>Email</span>
-          <input id="email" name="email" type="email" autocomplete="email" placeholder="you@example.com">
+          <input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com">
         </label>
         <label class="field">
           <span>Password</span>
@@ -39,11 +39,15 @@
           <span>Confirm password</span>
           <input id="confirm" name="confirm" type="password" required autocomplete="new-password">
         </label>
+        <label class="field">
+          <span>Workspace name (optional)</span>
+          <input id="workspaceName" name="workspace_name" type="text" autocomplete="organization">
+        </label>
         <fieldset class="security-options">
           <legend>Optional sign-in security</legend>
           <label class="choice">
             <input id="enableTotp" name="enable_totp" type="checkbox">
-            <span>Enable authenticator-app 2FA after setup</span>
+            <span>Enable authenticator-app 2FA after registration</span>
           </label>
           <label class="choice">
             <input
@@ -56,7 +60,7 @@
           </label>
           <p class="hint">You can complete either step now or continue without it.</p>
         </fieldset>
-        <button type="submit" class="primary">Create administrator</button>
+        <button type="submit" class="primary">Create account</button>
       </form>
       <section id="securitySetup" class="security-setup" hidden>
         <h2>Complete sign-in security</h2>
@@ -90,6 +94,7 @@
           </div>
         </div>
       </section>
+      <p class="hint auth-footnote">Already have an account? <a class="inline-link" href="{{ url_for('login', next=(next_path or '/')) }}">Sign in</a>.</p>
     </section>
   </main>
   <script src="{{ url_for('static', filename='auth.js') }}"></script>

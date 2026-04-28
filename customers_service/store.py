@@ -4,6 +4,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import secrets
 import threading
 import uuid
@@ -15,6 +16,17 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from werkzeug.security import check_password_hash, generate_password_hash
+
+from .authorization import (
+    GROUP_MEMBERSHIP_ROLE_MEMBER,
+    GROUP_MEMBERSHIP_ROLES,
+    SERVICE_ACCESS_NONE,
+    bootstrap_authorization_contract,
+    normalize_group_key,
+    normalize_group_membership_role,
+    normalize_service_access_level,
+    normalize_service_key,
+)
 
 UTC = dt.timezone.utc
 DEFAULT_ACCESS_TOKEN_TTL_SECONDS = int(
@@ -34,6 +46,9 @@ TEAM_MEMBERSHIP_STATUS_ACTIVE = "active"
 TEAM_MEMBERSHIP_STATUS_REJECTED = "rejected"
 TEAM_MEMBERSHIP_STATUS_LEFT = "left"
 TEAM_MEMBERSHIP_STATUS_REVOKED = "revoked"
+GROUP_SYSTEM_KEYS = frozenset({"admin", "user"})
+SERVICE_ACCOUNT_PROVIDER = "service_account"
+SERVICE_ACCOUNT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,47}$")
 
 SCHEMA_STATEMENTS: Sequence[str] = (
     """
@@ -109,6 +124,94 @@ SCHEMA_STATEMENTS: Sequence[str] = (
         ON nm_team_memberships (invited_by, status, updated_at DESC)
     """,
     """
+    CREATE TABLE IF NOT EXISTS nm_groups (
+        key TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        parent_key TEXT REFERENCES nm_groups(key) ON DELETE SET NULL,
+        system BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_groups_parent_idx
+        ON nm_groups (parent_key)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS nm_group_memberships (
+        group_key TEXT NOT NULL REFERENCES nm_groups(key) ON DELETE CASCADE,
+        username TEXT NOT NULL REFERENCES nm_users(username) ON DELETE CASCADE,
+        membership_role TEXT NOT NULL DEFAULT 'member'
+            CHECK (membership_role IN ('member', 'manager')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        PRIMARY KEY (group_key, username)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_group_memberships_user_idx
+        ON nm_group_memberships (username, membership_role, updated_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_group_memberships_group_idx
+        ON nm_group_memberships (group_key, membership_role, updated_at DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS nm_service_catalog (
+        service_key TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        description TEXT,
+        public_access_level TEXT NOT NULL DEFAULT 'none'
+            CHECK (public_access_level IN ('none', 'request', 'observe', 'use', 'control')),
+        dashboard_url TEXT,
+        marketing_url TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS nm_group_service_grants (
+        group_key TEXT NOT NULL REFERENCES nm_groups(key) ON DELETE CASCADE,
+        service_key TEXT NOT NULL REFERENCES nm_service_catalog(service_key) ON DELETE CASCADE,
+        access_level TEXT NOT NULL
+            CHECK (access_level IN ('none', 'request', 'observe', 'use', 'control')),
+        granted_by TEXT REFERENCES nm_users(username) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        PRIMARY KEY (group_key, service_key)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_group_service_grants_service_idx
+        ON nm_group_service_grants (service_key, access_level, updated_at DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS nm_service_accounts (
+        service_account_id TEXT PRIMARY KEY,
+        principal_username TEXT NOT NULL UNIQUE REFERENCES nm_users(username) ON DELETE CASCADE,
+        display_name TEXT NOT NULL,
+        description TEXT,
+        service_key TEXT REFERENCES nm_service_catalog(service_key) ON DELETE SET NULL,
+        created_by_username TEXT REFERENCES nm_users(username) ON DELETE SET NULL,
+        disabled BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_service_accounts_service_idx
+        ON nm_service_accounts (service_key, disabled, updated_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_service_accounts_creator_idx
+        ON nm_service_accounts (created_by_username, disabled, updated_at DESC)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS nm_auth_tokens (
         id TEXT PRIMARY KEY,
         username TEXT NOT NULL REFERENCES nm_users(username) ON DELETE CASCADE,
@@ -172,6 +275,52 @@ SCHEMA_STATEMENTS: Sequence[str] = (
         ON nm_token_ledger_entries (scope, account_id, ts DESC, id DESC)
     """,
 )
+
+
+def normalize_service_account_id(value: Any) -> str:
+    cleaned = str(value or "").strip().lower()
+    if not SERVICE_ACCOUNT_ID_RE.match(cleaned):
+        raise ValueError("invalid_service_account_id")
+    return cleaned
+
+
+def service_account_principal_username(service_account_id: Any) -> str:
+    return f"svc_{normalize_service_account_id(service_account_id)}"
+
+
+def _is_service_account_provider(entry: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    return str(entry.get("provider") or "").strip() == SERVICE_ACCOUNT_PROVIDER
+
+
+def _service_account_conflict(entry: Optional[Dict[str, Any]]) -> bool:
+    return _is_service_account_provider(entry)
+
+
+def _service_account_group_keys(payload: Dict[str, Any]) -> List[str]:
+    values: List[str] = []
+    raw_candidates: List[Any] = []
+    for key in ("group_keys", "groups"):
+        raw = payload.get(key)
+        if isinstance(raw, list):
+            raw_candidates.extend(raw)
+    memberships = payload.get("group_memberships")
+    if isinstance(memberships, list):
+        for entry in memberships:
+            if isinstance(entry, dict):
+                raw_candidates.append(entry.get("group_key") or entry.get("key"))
+    seen: set[str] = set()
+    for raw in raw_candidates:
+        try:
+            group_key = normalize_group_key(raw)
+        except ValueError:
+            continue
+        if group_key in seen:
+            continue
+        seen.add(group_key)
+        values.append(group_key)
+    return values
 
 
 def _timestamp(value: Optional[dt.datetime]) -> Optional[str]:
@@ -362,6 +511,8 @@ class PostgresCentralStore:
         self.ensure_schema()
         self.users = PostgresUserStore(self)
         self.teams = PostgresTeamStore(self)
+        self.access = PostgresAccessControlStore(self)
+        self.service_accounts = PostgresServiceAccountStore(self)
         self.access_tokens = PostgresAccessTokenStore(self)
         self.voice_tokens = PostgresVoiceTokenStore(self)
         self.sso_tokens = PostgresSsoStore(self)
@@ -378,33 +529,118 @@ class PostgresCentralStore:
                     conn.execute(statement)
 
     def bootstrap_from_env(self, default_user: str = "") -> None:
+        self.access.bootstrap_contract()
+        raw_service_accounts = (
+            os.getenv("CUSTOMERS_BOOTSTRAP_SERVICE_ACCOUNTS")
+            or os.getenv("CUSTOMERS_SERVICE_ACCOUNTS_JSON")
+            or ""
+        ).strip()
+        if raw_service_accounts:
+            try:
+                service_accounts_payload = json.loads(raw_service_accounts)
+            except Exception:
+                service_accounts_payload = None
+            if isinstance(service_accounts_payload, list):
+                for item in service_accounts_payload:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        service_account_id = normalize_service_account_id(
+                            item.get("service_account_id") or item.get("id") or item.get("key")
+                        )
+                    except ValueError:
+                        continue
+                    try:
+                        account = self.service_accounts.upsert_service_account(
+                            service_account_id,
+                            display_name=str(
+                                item.get("display_name") or item.get("name") or service_account_id
+                            ).strip()
+                            or service_account_id,
+                            description=str(item.get("description") or "").strip() or None,
+                            service_key=item.get("service_key") or item.get("service"),
+                            created_by=item.get("created_by") or default_user or None,
+                            metadata=item.get("metadata") if isinstance(item.get("metadata"), dict) else None,
+                            disabled=bool(item.get("disabled")),
+                        )
+                    except ValueError:
+                        continue
+                    for group_key in _service_account_group_keys(item):
+                        try:
+                            self.access.upsert_group_membership(
+                                group_key,
+                                str(account.get("principal_username") or "").strip(),
+                                membership_role=GROUP_MEMBERSHIP_ROLE_MEMBER,
+                            )
+                        except ValueError:
+                            continue
         raw = (
             os.getenv("CUSTOMERS_BOOTSTRAP_ACCESS_TOKENS")
             or os.getenv("REFINER_BOOTSTRAP_ACCESS_TOKENS")
             or ""
         ).strip()
-        if not raw:
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = None
+            if isinstance(payload, list):
+                for item in payload:
+                    if not isinstance(item, dict):
+                        continue
+                    token = str(item.get("token") or "").strip()
+                    username = str(item.get("user") or default_user or "").strip()
+                    if not token or not username:
+                        continue
+                    role = str(item.get("role") or "user").strip() or "user"
+                    label = str(item.get("label") or "").strip() or None
+                    ttl_seconds = item.get("ttl_seconds")
+                    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+                    self.users.ensure_user(username, role=role)
+                    self.access_tokens.ensure_token(
+                        username,
+                        token,
+                        label=label,
+                        ttl_seconds=int(ttl_seconds) if ttl_seconds not in (None, "") else None,
+                        meta=meta,
+                    )
+        raw_service_account_tokens = (
+            os.getenv("CUSTOMERS_BOOTSTRAP_SERVICE_ACCOUNT_TOKENS")
+            or os.getenv("CUSTOMERS_SERVICE_ACCOUNT_TOKENS_JSON")
+            or ""
+        ).strip()
+        if not raw_service_account_tokens:
             return
         try:
-            payload = json.loads(raw)
+            service_account_token_payload = json.loads(raw_service_account_tokens)
         except Exception:
             return
-        if not isinstance(payload, list):
+        if not isinstance(service_account_token_payload, list):
             return
-        for item in payload:
+        for item in service_account_token_payload:
             if not isinstance(item, dict):
                 continue
             token = str(item.get("token") or "").strip()
-            username = str(item.get("user") or default_user or "").strip()
-            if not token or not username:
+            if not token:
                 continue
-            role = str(item.get("role") or "user").strip() or "user"
+            service_account_id_raw = item.get("service_account_id") or item.get("id") or item.get("key")
+            try:
+                service_account_id = normalize_service_account_id(service_account_id_raw)
+            except ValueError:
+                continue
+            account = self.service_accounts.get_service_account(service_account_id, include_disabled=True)
+            if not account:
+                continue
             label = str(item.get("label") or "").strip() or None
             ttl_seconds = item.get("ttl_seconds")
             meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-            self.users.ensure_user(username, role=role)
+            meta = {
+                **meta,
+                "identity_type": "service_account",
+                "service_account_id": service_account_id,
+            }
             self.access_tokens.ensure_token(
-                username,
+                str(account.get("principal_username") or "").strip(),
                 token,
                 label=label,
                 ttl_seconds=int(ttl_seconds) if ttl_seconds not in (None, "") else None,
@@ -440,7 +676,14 @@ class PostgresUserStore:
 
     def count_users(self) -> int:
         with self.store.pool.connection() as conn:
-            row = conn.execute("SELECT COUNT(*) AS count FROM nm_users").fetchone()
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM nm_users
+                WHERE COALESCE(provider, '') <> %s
+                """,
+                (SERVICE_ACCOUNT_PROVIDER,),
+            ).fetchone()
         return int((row or {}).get("count") or 0)
 
     def has_users(self) -> bool:
@@ -493,6 +736,16 @@ class PostgresUserStore:
         password_hash = generate_password_hash(password)
         with self.store.pool.connection() as conn:
             with conn.transaction():
+                existing = conn.execute(
+                    """
+                    SELECT provider
+                    FROM nm_users
+                    WHERE username = %s
+                    """,
+                    (username,),
+                ).fetchone()
+                if _service_account_conflict(existing):
+                    raise ValueError("principal_username_conflict")
                 conn.execute(
                     """
                     INSERT INTO nm_users (
@@ -534,6 +787,16 @@ class PostgresUserStore:
         role_value = _normalize_user_role(role)
         with self.store.pool.connection() as conn:
             with conn.transaction():
+                existing = conn.execute(
+                    """
+                    SELECT provider
+                    FROM nm_users
+                    WHERE username = %s
+                    """,
+                    (username,),
+                ).fetchone()
+                if _service_account_conflict(existing):
+                    raise ValueError("principal_username_conflict")
                 conn.execute(
                     """
                     INSERT INTO nm_users (
@@ -1171,6 +1434,901 @@ class PostgresTeamStore:
         return True
 
 
+class PostgresAccessControlStore:
+    def __init__(self, store: PostgresCentralStore):
+        self.store = store
+
+    @staticmethod
+    def _group_payload(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(row, dict):
+            return None
+        group_key = str(row.get("key") or row.get("group_key") or "").strip().lower()
+        if not group_key:
+            return None
+        return {
+            "key": group_key,
+            "name": str(row.get("name") or group_key).strip() or group_key,
+            "parent_key": str(row.get("parent_key") or "").strip().lower() or None,
+            "system": bool(row.get("system")),
+            "metadata": dict(row.get("metadata")) if isinstance(row.get("metadata"), dict) else {},
+            "created_at": _timestamp(row.get("created_at")),
+            "updated_at": _timestamp(row.get("updated_at")),
+        }
+
+    @staticmethod
+    def _membership_payload(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(row, dict):
+            return None
+        group_key = str(row.get("group_key") or "").strip().lower()
+        username = str(row.get("username") or "").strip()
+        if not group_key or not username:
+            return None
+        return {
+            "group_key": group_key,
+            "group_name": str(row.get("group_name") or group_key).strip() or group_key,
+            "parent_key": str(row.get("parent_key") or "").strip().lower() or None,
+            "system": bool(row.get("system")),
+            "username": username,
+            "membership_role": normalize_group_membership_role(row.get("membership_role")),
+            "metadata": dict(row.get("metadata")) if isinstance(row.get("metadata"), dict) else {},
+            "created_at": _timestamp(row.get("created_at")),
+            "updated_at": _timestamp(row.get("updated_at")),
+        }
+
+    @staticmethod
+    def _service_payload(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(row, dict):
+            return None
+        service_key = str(row.get("service_key") or row.get("key") or "").strip().lower()
+        if not service_key:
+            return None
+        return {
+            "service_key": service_key,
+            "display_name": str(row.get("display_name") or service_key).strip() or service_key,
+            "description": str(row.get("description") or "").strip() or None,
+            "public_access_level": normalize_service_access_level(
+                row.get("public_access_level"),
+                default=SERVICE_ACCESS_NONE,
+            ),
+            "dashboard_url": str(row.get("dashboard_url") or "").strip() or None,
+            "marketing_url": str(row.get("marketing_url") or "").strip() or None,
+            "metadata": dict(row.get("metadata")) if isinstance(row.get("metadata"), dict) else {},
+            "created_at": _timestamp(row.get("created_at")),
+            "updated_at": _timestamp(row.get("updated_at")),
+        }
+
+    @staticmethod
+    def _grant_payload(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(row, dict):
+            return None
+        group_key = str(row.get("group_key") or "").strip().lower()
+        service_key = str(row.get("service_key") or "").strip().lower()
+        if not group_key or not service_key:
+            return None
+        payload: Dict[str, Any] = {
+            "group_key": group_key,
+            "service_key": service_key,
+            "access_level": normalize_service_access_level(row.get("access_level")),
+            "granted_by": str(row.get("granted_by") or "").strip() or None,
+            "metadata": dict(row.get("metadata")) if isinstance(row.get("metadata"), dict) else {},
+            "created_at": _timestamp(row.get("created_at")),
+            "updated_at": _timestamp(row.get("updated_at")),
+        }
+        display_name = str(row.get("display_name") or "").strip()
+        if display_name:
+            payload["display_name"] = display_name
+        public_access_level = row.get("public_access_level")
+        if public_access_level not in (None, ""):
+            payload["public_access_level"] = normalize_service_access_level(public_access_level)
+        return payload
+
+    @staticmethod
+    def _ordered_groups(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        pending: Dict[str, Dict[str, Any]] = {}
+        for raw in records:
+            try:
+                key = normalize_group_key(raw.get("key") or raw.get("group_key"))
+            except ValueError:
+                continue
+            parent_raw = raw.get("parent_key") or raw.get("parent_id")
+            if parent_raw in (None, ""):
+                parent_key = None
+            else:
+                try:
+                    parent_key = normalize_group_key(parent_raw)
+                except ValueError:
+                    continue
+            pending[key] = {
+                "key": key,
+                "name": str(raw.get("name") or key).strip() or key,
+                "parent_key": parent_key,
+                "system": bool(raw.get("system")),
+                "metadata": dict(raw.get("metadata")) if isinstance(raw.get("metadata"), dict) else {},
+            }
+        ordered: List[Dict[str, Any]] = []
+        emitted: set[str] = set()
+        while pending:
+            progressed = False
+            for group_key, record in list(pending.items()):
+                parent_key = record.get("parent_key")
+                if not parent_key or parent_key in emitted or parent_key not in pending:
+                    ordered.append(record)
+                    emitted.add(group_key)
+                    pending.pop(group_key, None)
+                    progressed = True
+            if progressed:
+                continue
+            group_key = sorted(pending.keys())[0]
+            record = dict(pending.pop(group_key))
+            if record.get("parent_key") == group_key:
+                record["parent_key"] = None
+            ordered.append(record)
+            emitted.add(group_key)
+        return ordered
+
+    def _group_exists(self, conn: Any, group_key: str) -> bool:
+        row = conn.execute("SELECT key FROM nm_groups WHERE key = %s", (group_key,)).fetchone()
+        return bool((row or {}).get("key"))
+
+    def _service_exists(self, conn: Any, service_key: str) -> bool:
+        row = conn.execute(
+            "SELECT service_key FROM nm_service_catalog WHERE service_key = %s",
+            (service_key,),
+        ).fetchone()
+        return bool((row or {}).get("service_key"))
+
+    def _user_exists(self, conn: Any, username: str) -> bool:
+        row = conn.execute("SELECT username FROM nm_users WHERE username = %s", (username,)).fetchone()
+        return bool((row or {}).get("username"))
+
+    def bootstrap_contract(self, payload: Optional[Dict[str, Any]] = None) -> None:
+        contract = payload if isinstance(payload, dict) else bootstrap_authorization_contract()
+        groups = contract.get("groups") if isinstance(contract.get("groups"), list) else []
+        services = contract.get("services") if isinstance(contract.get("services"), list) else []
+        grants = contract.get("grants") if isinstance(contract.get("grants"), list) else []
+        ordered_groups = self._ordered_groups([dict(item) for item in groups if isinstance(item, dict)])
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                for group in ordered_groups:
+                    try:
+                        self._upsert_group(conn, group)
+                    except ValueError:
+                        continue
+                for service in services:
+                    if not isinstance(service, dict):
+                        continue
+                    try:
+                        self._upsert_service(conn, service)
+                    except ValueError:
+                        continue
+                for grant in grants:
+                    if not isinstance(grant, dict):
+                        continue
+                    try:
+                        self._upsert_group_service_grant(conn, grant)
+                    except ValueError:
+                        continue
+
+    def _upsert_group(self, conn: Any, payload: Dict[str, Any]) -> None:
+        group_key = normalize_group_key(payload.get("key") or payload.get("group_key"))
+        parent_raw = payload.get("parent_key") or payload.get("parent_id")
+        parent_key = None
+        if parent_raw not in (None, ""):
+            parent_key = normalize_group_key(parent_raw)
+            if parent_key == group_key:
+                raise ValueError("group_parent_cycle")
+            if not self._group_exists(conn, parent_key):
+                raise ValueError("parent_group_not_found")
+        existing = conn.execute(
+            """
+            SELECT name, system, metadata
+            FROM nm_groups
+            WHERE key = %s
+            """,
+            (group_key,),
+        ).fetchone()
+        name = str(payload.get("name") or (existing or {}).get("name") or group_key).strip() or group_key
+        metadata = payload.get("metadata")
+        if metadata is None and isinstance((existing or {}).get("metadata"), dict):
+            metadata = dict((existing or {}).get("metadata") or {})
+        metadata_value = dict(metadata or {})
+        system = bool(payload.get("system")) or bool((existing or {}).get("system"))
+        conn.execute(
+            """
+            INSERT INTO nm_groups (key, name, parent_key, system, created_at, updated_at, metadata)
+            VALUES (%s, %s, %s, %s, NOW(), NOW(), %s)
+            ON CONFLICT (key) DO UPDATE
+            SET name = EXCLUDED.name,
+                parent_key = EXCLUDED.parent_key,
+                system = EXCLUDED.system,
+                metadata = EXCLUDED.metadata,
+                updated_at = NOW()
+            """,
+            (group_key, name, parent_key, system, _jsonb(metadata_value)),
+        )
+
+    def list_groups(self) -> List[Dict[str, Any]]:
+        with self.store.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT key, name, parent_key, system, created_at, updated_at, metadata
+                FROM nm_groups
+                ORDER BY key ASC
+                """
+            ).fetchall()
+        payload: List[Dict[str, Any]] = []
+        for row in rows or []:
+            entry = self._group_payload(row)
+            if entry:
+                payload.append(entry)
+        return payload
+
+    def get_group(self, group_key: str) -> Optional[Dict[str, Any]]:
+        cleaned = normalize_group_key(group_key)
+        with self.store.pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT key, name, parent_key, system, created_at, updated_at, metadata
+                FROM nm_groups
+                WHERE key = %s
+                """,
+                (cleaned,),
+            ).fetchone()
+        return self._group_payload(row)
+
+    def upsert_group(
+        self,
+        group_key: str,
+        *,
+        name: Optional[str] = None,
+        parent_key: Optional[str] = None,
+        system: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cleaned = normalize_group_key(group_key)
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                self._upsert_group(
+                    conn,
+                    {
+                        "key": cleaned,
+                        "name": name,
+                        "parent_key": parent_key,
+                        "system": system,
+                        "metadata": dict(metadata or {}) if metadata is not None else None,
+                    },
+                )
+        group = self.get_group(cleaned)
+        if not group:
+            raise RuntimeError("group_upsert_failed")
+        return group
+
+    def list_group_memberships(
+        self,
+        *,
+        group_key: Optional[str] = None,
+        username: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if group_key:
+            clauses.append("m.group_key = %s")
+            params.append(normalize_group_key(group_key))
+        if username:
+            cleaned_user = str(username or "").strip()
+            if cleaned_user:
+                clauses.append("m.username = %s")
+                params.append(cleaned_user)
+        sql = """
+            SELECT
+                m.group_key,
+                g.name AS group_name,
+                g.parent_key,
+                g.system,
+                m.username,
+                m.membership_role,
+                m.created_at,
+                m.updated_at,
+                m.metadata
+            FROM nm_group_memberships AS m
+            JOIN nm_groups AS g ON g.key = m.group_key
+        """
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY m.group_key ASC, m.username ASC"
+        with self.store.pool.connection() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        payload: List[Dict[str, Any]] = []
+        for row in rows or []:
+            entry = self._membership_payload(row)
+            if entry:
+                payload.append(entry)
+        return payload
+
+    def upsert_group_membership(
+        self,
+        group_key: str,
+        username: str,
+        *,
+        membership_role: str = GROUP_MEMBERSHIP_ROLE_MEMBER,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cleaned_group = normalize_group_key(group_key)
+        cleaned_user = str(username or "").strip()
+        if not cleaned_user:
+            raise ValueError("username_required")
+        role_value = normalize_group_membership_role(membership_role)
+        metadata_value = dict(metadata or {})
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                if not self._group_exists(conn, cleaned_group):
+                    raise ValueError("group_not_found")
+                if not self._user_exists(conn, cleaned_user):
+                    raise ValueError("user_not_found")
+                conn.execute(
+                    """
+                    INSERT INTO nm_group_memberships (
+                        group_key,
+                        username,
+                        membership_role,
+                        created_at,
+                        updated_at,
+                        metadata
+                    ) VALUES (%s, %s, %s, NOW(), NOW(), %s)
+                    ON CONFLICT (group_key, username) DO UPDATE
+                    SET membership_role = EXCLUDED.membership_role,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = NOW()
+                    """,
+                    (cleaned_group, cleaned_user, role_value, _jsonb(metadata_value)),
+                )
+        membership = next(
+            (
+                item
+                for item in self.list_group_memberships(group_key=cleaned_group, username=cleaned_user)
+                if item.get("group_key") == cleaned_group and item.get("username") == cleaned_user
+            ),
+            None,
+        )
+        if not membership:
+            raise RuntimeError("group_membership_upsert_failed")
+        return membership
+
+    def delete_group_membership(self, group_key: str, username: str) -> bool:
+        cleaned_group = normalize_group_key(group_key)
+        cleaned_user = str(username or "").strip()
+        if not cleaned_user:
+            return False
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    DELETE FROM nm_group_memberships
+                    WHERE group_key = %s AND username = %s
+                    RETURNING group_key
+                    """,
+                    (cleaned_group, cleaned_user),
+                ).fetchone()
+        return bool(row)
+
+    def _upsert_service(self, conn: Any, payload: Dict[str, Any]) -> None:
+        service_key = normalize_service_key(payload.get("service_key") or payload.get("key"))
+        existing = conn.execute(
+            """
+            SELECT display_name, description, dashboard_url, marketing_url, metadata
+            FROM nm_service_catalog
+            WHERE service_key = %s
+            """,
+            (service_key,),
+        ).fetchone()
+        display_name = str(payload.get("display_name") or (existing or {}).get("display_name") or service_key).strip() or service_key
+        description = payload.get("description")
+        if description is None:
+            description = (existing or {}).get("description")
+        description_value = str(description or "").strip() or None
+        dashboard_url = payload.get("dashboard_url")
+        if dashboard_url is None:
+            dashboard_url = (existing or {}).get("dashboard_url")
+        marketing_url = payload.get("marketing_url")
+        if marketing_url is None:
+            marketing_url = (existing or {}).get("marketing_url")
+        metadata = payload.get("metadata")
+        if metadata is None and isinstance((existing or {}).get("metadata"), dict):
+            metadata = dict((existing or {}).get("metadata") or {})
+        metadata_value = dict(metadata or {})
+        public_access_level = normalize_service_access_level(
+            payload.get("public_access_level"),
+            default=SERVICE_ACCESS_NONE,
+        )
+        conn.execute(
+            """
+            INSERT INTO nm_service_catalog (
+                service_key,
+                display_name,
+                description,
+                public_access_level,
+                dashboard_url,
+                marketing_url,
+                created_at,
+                updated_at,
+                metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW(), %s)
+            ON CONFLICT (service_key) DO UPDATE
+            SET display_name = EXCLUDED.display_name,
+                description = EXCLUDED.description,
+                public_access_level = EXCLUDED.public_access_level,
+                dashboard_url = EXCLUDED.dashboard_url,
+                marketing_url = EXCLUDED.marketing_url,
+                metadata = EXCLUDED.metadata,
+                updated_at = NOW()
+            """,
+            (
+                service_key,
+                display_name,
+                description_value,
+                public_access_level,
+                str(dashboard_url or "").strip() or None,
+                str(marketing_url or "").strip() or None,
+                _jsonb(metadata_value),
+            ),
+        )
+
+    def list_services(self) -> List[Dict[str, Any]]:
+        with self.store.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    service_key,
+                    display_name,
+                    description,
+                    public_access_level,
+                    dashboard_url,
+                    marketing_url,
+                    created_at,
+                    updated_at,
+                    metadata
+                FROM nm_service_catalog
+                ORDER BY service_key ASC
+                """
+            ).fetchall()
+        payload: List[Dict[str, Any]] = []
+        for row in rows or []:
+            entry = self._service_payload(row)
+            if entry:
+                payload.append(entry)
+        return payload
+
+    def get_service(self, service_key: str) -> Optional[Dict[str, Any]]:
+        cleaned = normalize_service_key(service_key)
+        with self.store.pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    service_key,
+                    display_name,
+                    description,
+                    public_access_level,
+                    dashboard_url,
+                    marketing_url,
+                    created_at,
+                    updated_at,
+                    metadata
+                FROM nm_service_catalog
+                WHERE service_key = %s
+                """,
+                (cleaned,),
+            ).fetchone()
+        return self._service_payload(row)
+
+    def upsert_service(
+        self,
+        service_key: str,
+        *,
+        display_name: Optional[str] = None,
+        description: Optional[str] = None,
+        public_access_level: str = SERVICE_ACCESS_NONE,
+        dashboard_url: Optional[str] = None,
+        marketing_url: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cleaned = normalize_service_key(service_key)
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                self._upsert_service(
+                    conn,
+                    {
+                        "service_key": cleaned,
+                        "display_name": display_name,
+                        "description": description,
+                        "public_access_level": public_access_level,
+                        "dashboard_url": dashboard_url,
+                        "marketing_url": marketing_url,
+                        "metadata": dict(metadata or {}) if metadata is not None else None,
+                    },
+                )
+        service = self.get_service(cleaned)
+        if not service:
+            raise RuntimeError("service_upsert_failed")
+        return service
+
+    def _upsert_group_service_grant(self, conn: Any, payload: Dict[str, Any]) -> None:
+        group_key = normalize_group_key(payload.get("group_key"))
+        service_key = normalize_service_key(payload.get("service_key"))
+        if not self._group_exists(conn, group_key):
+            raise ValueError("group_not_found")
+        if not self._service_exists(conn, service_key):
+            raise ValueError("service_not_found")
+        access_level = normalize_service_access_level(payload.get("access_level"))
+        granted_by_raw = str(payload.get("granted_by") or "").strip() or None
+        if granted_by_raw and not self._user_exists(conn, granted_by_raw):
+            granted_by_raw = None
+        existing = conn.execute(
+            """
+            SELECT metadata
+            FROM nm_group_service_grants
+            WHERE group_key = %s AND service_key = %s
+            """,
+            (group_key, service_key),
+        ).fetchone()
+        metadata = payload.get("metadata")
+        if metadata is None and isinstance((existing or {}).get("metadata"), dict):
+            metadata = dict((existing or {}).get("metadata") or {})
+        metadata_value = dict(metadata or {})
+        conn.execute(
+            """
+            INSERT INTO nm_group_service_grants (
+                group_key,
+                service_key,
+                access_level,
+                granted_by,
+                created_at,
+                updated_at,
+                metadata
+            ) VALUES (%s, %s, %s, %s, NOW(), NOW(), %s)
+            ON CONFLICT (group_key, service_key) DO UPDATE
+            SET access_level = EXCLUDED.access_level,
+                granted_by = EXCLUDED.granted_by,
+                metadata = EXCLUDED.metadata,
+                updated_at = NOW()
+            """,
+            (group_key, service_key, access_level, granted_by_raw, _jsonb(metadata_value)),
+        )
+
+    def list_group_service_grants(
+        self,
+        *,
+        group_key: Optional[str] = None,
+        service_key: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if group_key:
+            clauses.append("g.group_key = %s")
+            params.append(normalize_group_key(group_key))
+        if service_key:
+            clauses.append("g.service_key = %s")
+            params.append(normalize_service_key(service_key))
+        sql = """
+            SELECT
+                g.group_key,
+                g.service_key,
+                g.access_level,
+                g.granted_by,
+                g.created_at,
+                g.updated_at,
+                g.metadata,
+                s.display_name,
+                s.public_access_level
+            FROM nm_group_service_grants AS g
+            JOIN nm_service_catalog AS s ON s.service_key = g.service_key
+        """
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY g.group_key ASC, g.service_key ASC"
+        with self.store.pool.connection() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        payload: List[Dict[str, Any]] = []
+        for row in rows or []:
+            entry = self._grant_payload(row)
+            if entry:
+                payload.append(entry)
+        return payload
+
+    def get_group_service_grant(self, group_key: str, service_key: str) -> Optional[Dict[str, Any]]:
+        grants = self.list_group_service_grants(group_key=group_key, service_key=service_key)
+        return grants[0] if grants else None
+
+    def upsert_group_service_grant(
+        self,
+        group_key: str,
+        service_key: str,
+        *,
+        access_level: str,
+        granted_by: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cleaned_group = normalize_group_key(group_key)
+        cleaned_service = normalize_service_key(service_key)
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                self._upsert_group_service_grant(
+                    conn,
+                    {
+                        "group_key": cleaned_group,
+                        "service_key": cleaned_service,
+                        "access_level": access_level,
+                        "granted_by": granted_by,
+                        "metadata": dict(metadata or {}) if metadata is not None else None,
+                    },
+                )
+        grant = self.get_group_service_grant(cleaned_group, cleaned_service)
+        if not grant:
+            raise RuntimeError("group_service_grant_upsert_failed")
+        return grant
+
+    def delete_group_service_grant(self, group_key: str, service_key: str) -> bool:
+        cleaned_group = normalize_group_key(group_key)
+        cleaned_service = normalize_service_key(service_key)
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    DELETE FROM nm_group_service_grants
+                    WHERE group_key = %s AND service_key = %s
+                    RETURNING group_key
+                    """,
+                    (cleaned_group, cleaned_service),
+                ).fetchone()
+        return bool(row)
+
+
+class PostgresServiceAccountStore:
+    def __init__(self, store: PostgresCentralStore):
+        self.store = store
+
+    @staticmethod
+    def _payload_from_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(row, dict):
+            return None
+        service_account_id = str(row.get("service_account_id") or "").strip().lower()
+        principal_username = str(row.get("principal_username") or "").strip()
+        if not service_account_id or not principal_username:
+            return None
+        return {
+            "service_account_id": service_account_id,
+            "principal_username": principal_username,
+            "display_name": str(row.get("display_name") or service_account_id).strip() or service_account_id,
+            "description": str(row.get("description") or "").strip() or None,
+            "service_key": str(row.get("service_key") or "").strip().lower() or None,
+            "created_by": str(row.get("created_by_username") or "").strip() or None,
+            "disabled": bool(row.get("disabled")),
+            "metadata": dict(row.get("metadata")) if isinstance(row.get("metadata"), dict) else {},
+            "created_at": _timestamp(row.get("created_at")),
+            "updated_at": _timestamp(row.get("updated_at")),
+        }
+
+    def _ensure_principal_user(self, conn: Any, service_account_id: str, principal_username: str) -> None:
+        conn.execute(
+            """
+            INSERT INTO nm_users (
+                username,
+                password_hash,
+                role,
+                email,
+                external,
+                provider,
+                subject,
+                created_at,
+                updated_at,
+                metadata
+            ) VALUES (%s, NULL, 'user', NULL, TRUE, %s, %s, NOW(), NOW(), '{}'::jsonb)
+            ON CONFLICT (username) DO UPDATE
+            SET role = 'user',
+                external = TRUE,
+                provider = %s,
+                subject = %s,
+                updated_at = NOW()
+            """,
+            (
+                principal_username,
+                SERVICE_ACCOUNT_PROVIDER,
+                service_account_id,
+                SERVICE_ACCOUNT_PROVIDER,
+                service_account_id,
+            ),
+        )
+
+    def list_service_accounts(self, *, include_disabled: bool = False) -> List[Dict[str, Any]]:
+        sql = """
+            SELECT
+                service_account_id,
+                principal_username,
+                display_name,
+                description,
+                service_key,
+                created_by_username,
+                disabled,
+                metadata,
+                created_at,
+                updated_at
+            FROM nm_service_accounts
+        """
+        params: List[Any] = []
+        if not include_disabled:
+            sql += " WHERE NOT disabled"
+        sql += " ORDER BY service_account_id ASC"
+        with self.store.pool.connection() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        payload: List[Dict[str, Any]] = []
+        for row in rows or []:
+            entry = self._payload_from_row(row)
+            if entry:
+                payload.append(entry)
+        return payload
+
+    def get_service_account(
+        self,
+        service_account_id: str,
+        *,
+        include_disabled: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        cleaned = normalize_service_account_id(service_account_id)
+        sql = """
+            SELECT
+                service_account_id,
+                principal_username,
+                display_name,
+                description,
+                service_key,
+                created_by_username,
+                disabled,
+                metadata,
+                created_at,
+                updated_at
+            FROM nm_service_accounts
+            WHERE service_account_id = %s
+        """
+        params: List[Any] = [cleaned]
+        if not include_disabled:
+            sql += " AND NOT disabled"
+        with self.store.pool.connection() as conn:
+            row = conn.execute(sql, tuple(params)).fetchone()
+        return self._payload_from_row(row)
+
+    def get_by_principal_username(
+        self,
+        principal_username: str,
+        *,
+        include_disabled: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        cleaned_principal = str(principal_username or "").strip()
+        if not cleaned_principal:
+            return None
+        sql = """
+            SELECT
+                service_account_id,
+                principal_username,
+                display_name,
+                description,
+                service_key,
+                created_by_username,
+                disabled,
+                metadata,
+                created_at,
+                updated_at
+            FROM nm_service_accounts
+            WHERE principal_username = %s
+        """
+        params: List[Any] = [cleaned_principal]
+        if not include_disabled:
+            sql += " AND NOT disabled"
+        with self.store.pool.connection() as conn:
+            row = conn.execute(sql, tuple(params)).fetchone()
+        return self._payload_from_row(row)
+
+    def upsert_service_account(
+        self,
+        service_account_id: str,
+        *,
+        display_name: Optional[str] = None,
+        description: Optional[str] = None,
+        service_key: Optional[str] = None,
+        created_by: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        disabled: bool = False,
+    ) -> Dict[str, Any]:
+        cleaned_id = normalize_service_account_id(service_account_id)
+        principal_username = service_account_principal_username(cleaned_id)
+        cleaned_service_key = None
+        if service_key not in (None, ""):
+            cleaned_service_key = normalize_service_key(service_key)
+        cleaned_created_by = str(created_by or "").strip() or None
+        metadata_value = dict(metadata or {})
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                if cleaned_service_key and not self.store.access._service_exists(conn, cleaned_service_key):
+                    raise ValueError("service_not_found")
+                if cleaned_created_by and not self.store.access._user_exists(conn, cleaned_created_by):
+                    raise ValueError("created_by_not_found")
+                existing_user = conn.execute(
+                    """
+                    SELECT provider, subject
+                    FROM nm_users
+                    WHERE username = %s
+                    """,
+                    (principal_username,),
+                ).fetchone()
+                if existing_user and (
+                    str(existing_user.get("provider") or "").strip() != SERVICE_ACCOUNT_PROVIDER
+                    or str(existing_user.get("subject") or "").strip() != cleaned_id
+                ):
+                    raise ValueError("principal_username_conflict")
+                self._ensure_principal_user(conn, cleaned_id, principal_username)
+                conn.execute(
+                    """
+                    INSERT INTO nm_service_accounts (
+                        service_account_id,
+                        principal_username,
+                        display_name,
+                        description,
+                        service_key,
+                        created_by_username,
+                        disabled,
+                        created_at,
+                        updated_at,
+                        metadata
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s)
+                    ON CONFLICT (service_account_id) DO UPDATE
+                    SET display_name = EXCLUDED.display_name,
+                        description = EXCLUDED.description,
+                        service_key = COALESCE(EXCLUDED.service_key, nm_service_accounts.service_key),
+                        disabled = EXCLUDED.disabled,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = NOW()
+                    """,
+                    (
+                        cleaned_id,
+                        principal_username,
+                        str(display_name or cleaned_id).strip() or cleaned_id,
+                        str(description or "").strip() or None,
+                        cleaned_service_key,
+                        cleaned_created_by,
+                        bool(disabled),
+                        _jsonb(metadata_value),
+                    ),
+                )
+        account = self.get_service_account(cleaned_id, include_disabled=True)
+        if not account:
+            raise RuntimeError("service_account_upsert_failed")
+        return account
+
+    def set_disabled(self, service_account_id: str, disabled: bool) -> Optional[Dict[str, Any]]:
+        cleaned_id = normalize_service_account_id(service_account_id)
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    UPDATE nm_service_accounts
+                    SET disabled = %s,
+                        updated_at = NOW()
+                    WHERE service_account_id = %s
+                    RETURNING
+                        service_account_id,
+                        principal_username,
+                        display_name,
+                        description,
+                        service_key,
+                        created_by_username,
+                        disabled,
+                        metadata,
+                        created_at,
+                        updated_at
+                    """,
+                    (bool(disabled), cleaned_id),
+                ).fetchone()
+        return self._payload_from_row(row)
+
+
 class PostgresAccessTokenStore:
     def __init__(self, store: PostgresCentralStore):
         self.store = store
@@ -1326,6 +2484,51 @@ class PostgresAccessTokenStore:
             "expires_at": _timestamp(row.get("expires_at")),
             "meta": row.get("meta") if isinstance(row.get("meta"), dict) else {},
         }
+
+    def list_tokens(self, user: Optional[str] = None) -> List[Dict[str, Any]]:
+        params: List[Any] = []
+        sql = """
+            SELECT id, username, label, created_at, expires_at, last_used_at, disabled, meta
+            FROM nm_auth_tokens
+            WHERE kind = 'access'
+        """
+        cleaned_user = str(user or "").strip()
+        if cleaned_user:
+            sql += " AND username = %s"
+            params.append(cleaned_user)
+        sql += " ORDER BY created_at DESC"
+        with self.store.pool.connection() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [
+            {
+                "id": row.get("id"),
+                "user": row.get("username"),
+                "label": row.get("label"),
+                "created_at": _timestamp(row.get("created_at")),
+                "expires_at": _timestamp(row.get("expires_at")),
+                "last_used_at": _timestamp(row.get("last_used_at")),
+                "disabled": bool(row.get("disabled")),
+                "meta": row.get("meta") if isinstance(row.get("meta"), dict) else {},
+            }
+            for row in rows or []
+        ]
+
+    def revoke(self, token_id: str) -> bool:
+        cleaned = str(token_id or "").strip()
+        if not cleaned:
+            return False
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    UPDATE nm_auth_tokens
+                    SET disabled = TRUE
+                    WHERE id = %s AND kind = 'access'
+                    RETURNING id
+                    """,
+                    (cleaned,),
+                ).fetchone()
+        return bool(row)
 
 
 class PostgresVoiceTokenStore:
@@ -1829,7 +3032,12 @@ class FileUserStore:
 
     def count_users(self) -> int:
         with self.lock:
-            return len(self.data)
+            return sum(
+                1
+                for entry in self.data.values()
+                if isinstance(entry, dict)
+                and str(entry.get("provider") or "").strip() != SERVICE_ACCOUNT_PROVIDER
+            )
 
     def has_users(self) -> bool:
         return self.count_users() > 0
@@ -1874,6 +3082,8 @@ class FileUserStore:
         role_value = _normalize_user_role(role)
         now = _timestamp(dt.datetime.now(UTC))
         with self.lock:
+            if _service_account_conflict(self.get_user(username)):
+                raise ValueError("principal_username_conflict")
             self.data[username] = {
                 "password_hash": generate_password_hash(password),
                 "role": role_value,
@@ -1901,6 +3111,8 @@ class FileUserStore:
         role_value = _normalize_user_role(role)
         now = _timestamp(dt.datetime.now(UTC))
         with self.lock:
+            if _service_account_conflict(self.get_user(username)):
+                raise ValueError("principal_username_conflict")
             entry = self.data.get(username, {})
             entry.setdefault("created_at", now)
             entry["updated_at"] = now
@@ -2398,6 +3610,623 @@ class FileTeamStore:
         return False
 
 
+class FileAccessControlStore:
+    def __init__(self, path: Path, users: FileUserStore):
+        self.path = path
+        self.users = users
+        self.lock = threading.RLock()
+        payload = _read_json(
+            path,
+            {
+                "version": 1,
+                "groups": {},
+                "memberships": {},
+                "services": {},
+                "grants": {},
+            },
+        )
+        if not isinstance(payload, dict):
+            payload = {
+                "version": 1,
+                "groups": {},
+                "memberships": {},
+                "services": {},
+                "grants": {},
+            }
+        for key in ("groups", "memberships", "services", "grants"):
+            if not isinstance(payload.get(key), dict):
+                payload[key] = {}
+        self.data = payload
+
+    def _write(self) -> None:
+        _write_json_atomic(self.path, self.data)
+
+    def _timestamp_now(self) -> str:
+        return _timestamp(dt.datetime.now(UTC)) or ""
+
+    @staticmethod
+    def _membership_id(group_key: str, username: str) -> str:
+        return f"{group_key}:{username}"
+
+    @staticmethod
+    def _grant_id(group_key: str, service_key: str) -> str:
+        return f"{group_key}:{service_key}"
+
+    @staticmethod
+    def _group_payload(entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(entry, dict):
+            return None
+        group_key = str(entry.get("key") or "").strip().lower()
+        if not group_key:
+            return None
+        return {
+            "key": group_key,
+            "name": str(entry.get("name") or group_key).strip() or group_key,
+            "parent_key": str(entry.get("parent_key") or "").strip().lower() or None,
+            "system": bool(entry.get("system")),
+            "metadata": dict(entry.get("metadata")) if isinstance(entry.get("metadata"), dict) else {},
+            "created_at": entry.get("created_at"),
+            "updated_at": entry.get("updated_at"),
+        }
+
+    def _membership_payload(self, entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(entry, dict):
+            return None
+        group_key = str(entry.get("group_key") or "").strip().lower()
+        username = str(entry.get("username") or "").strip()
+        if not group_key or not username:
+            return None
+        group = self.data.get("groups", {}).get(group_key) or {}
+        return {
+            "group_key": group_key,
+            "group_name": str(group.get("name") or group_key).strip() or group_key,
+            "parent_key": str(group.get("parent_key") or "").strip().lower() or None,
+            "system": bool(group.get("system")),
+            "username": username,
+            "membership_role": normalize_group_membership_role(entry.get("membership_role")),
+            "metadata": dict(entry.get("metadata")) if isinstance(entry.get("metadata"), dict) else {},
+            "created_at": entry.get("created_at"),
+            "updated_at": entry.get("updated_at"),
+        }
+
+    @staticmethod
+    def _service_payload(entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(entry, dict):
+            return None
+        service_key = str(entry.get("service_key") or "").strip().lower()
+        if not service_key:
+            return None
+        return {
+            "service_key": service_key,
+            "display_name": str(entry.get("display_name") or service_key).strip() or service_key,
+            "description": str(entry.get("description") or "").strip() or None,
+            "public_access_level": normalize_service_access_level(
+                entry.get("public_access_level"),
+                default=SERVICE_ACCESS_NONE,
+            ),
+            "dashboard_url": str(entry.get("dashboard_url") or "").strip() or None,
+            "marketing_url": str(entry.get("marketing_url") or "").strip() or None,
+            "metadata": dict(entry.get("metadata")) if isinstance(entry.get("metadata"), dict) else {},
+            "created_at": entry.get("created_at"),
+            "updated_at": entry.get("updated_at"),
+        }
+
+    def _grant_payload(self, entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(entry, dict):
+            return None
+        group_key = str(entry.get("group_key") or "").strip().lower()
+        service_key = str(entry.get("service_key") or "").strip().lower()
+        if not group_key or not service_key:
+            return None
+        service = self.data.get("services", {}).get(service_key) or {}
+        payload: Dict[str, Any] = {
+            "group_key": group_key,
+            "service_key": service_key,
+            "access_level": normalize_service_access_level(entry.get("access_level")),
+            "granted_by": str(entry.get("granted_by") or "").strip() or None,
+            "metadata": dict(entry.get("metadata")) if isinstance(entry.get("metadata"), dict) else {},
+            "created_at": entry.get("created_at"),
+            "updated_at": entry.get("updated_at"),
+        }
+        if service:
+            payload["display_name"] = str(service.get("display_name") or service_key).strip() or service_key
+            payload["public_access_level"] = normalize_service_access_level(
+                service.get("public_access_level"),
+                default=SERVICE_ACCESS_NONE,
+            )
+        return payload
+
+    def bootstrap_contract(self, payload: Optional[Dict[str, Any]] = None) -> None:
+        contract = payload if isinstance(payload, dict) else bootstrap_authorization_contract()
+        groups = contract.get("groups") if isinstance(contract.get("groups"), list) else []
+        services = contract.get("services") if isinstance(contract.get("services"), list) else []
+        grants = contract.get("grants") if isinstance(contract.get("grants"), list) else []
+        with self.lock:
+            for group in PostgresAccessControlStore._ordered_groups([dict(item) for item in groups if isinstance(item, dict)]):
+                try:
+                    self._upsert_group_locked(group)
+                except ValueError:
+                    continue
+            for service in services:
+                if not isinstance(service, dict):
+                    continue
+                try:
+                    self._upsert_service_locked(service)
+                except ValueError:
+                    continue
+            for grant in grants:
+                if not isinstance(grant, dict):
+                    continue
+                try:
+                    self._upsert_group_service_grant_locked(grant)
+                except ValueError:
+                    continue
+            self._write()
+
+    def list_groups(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            values = [dict(item) for item in self.data.get("groups", {}).values() if isinstance(item, dict)]
+        payload: List[Dict[str, Any]] = []
+        for entry in sorted(values, key=lambda item: str(item.get("key") or "")):
+            normalized = self._group_payload(entry)
+            if normalized:
+                payload.append(normalized)
+        return payload
+
+    def get_group(self, group_key: str) -> Optional[Dict[str, Any]]:
+        cleaned = normalize_group_key(group_key)
+        with self.lock:
+            entry = dict(self.data.get("groups", {}).get(cleaned) or {})
+        return self._group_payload(entry)
+
+    def _upsert_group_locked(self, payload: Dict[str, Any]) -> None:
+        group_key = normalize_group_key(payload.get("key") or payload.get("group_key"))
+        parent_raw = payload.get("parent_key") or payload.get("parent_id")
+        parent_key = None
+        if parent_raw not in (None, ""):
+            parent_key = normalize_group_key(parent_raw)
+            if parent_key == group_key:
+                raise ValueError("group_parent_cycle")
+            if parent_key not in self.data.get("groups", {}):
+                raise ValueError("parent_group_not_found")
+        existing = self.data.get("groups", {}).get(group_key) or {}
+        metadata = payload.get("metadata")
+        if metadata is None and isinstance(existing.get("metadata"), dict):
+            metadata = dict(existing.get("metadata") or {})
+        now = self._timestamp_now()
+        self.data.setdefault("groups", {})[group_key] = {
+            "key": group_key,
+            "name": str(payload.get("name") or existing.get("name") or group_key).strip() or group_key,
+            "parent_key": parent_key,
+            "system": bool(payload.get("system")) or bool(existing.get("system")),
+            "metadata": dict(metadata or {}),
+            "created_at": existing.get("created_at") or now,
+            "updated_at": now,
+        }
+
+    def upsert_group(
+        self,
+        group_key: str,
+        *,
+        name: Optional[str] = None,
+        parent_key: Optional[str] = None,
+        system: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cleaned = normalize_group_key(group_key)
+        with self.lock:
+            self._upsert_group_locked(
+                {
+                    "key": cleaned,
+                    "name": name,
+                    "parent_key": parent_key,
+                    "system": system,
+                    "metadata": dict(metadata or {}) if metadata is not None else None,
+                }
+            )
+            self._write()
+            entry = dict(self.data.get("groups", {}).get(cleaned) or {})
+        group = self._group_payload(entry)
+        if not group:
+            raise RuntimeError("group_upsert_failed")
+        return group
+
+    def list_group_memberships(
+        self,
+        *,
+        group_key: Optional[str] = None,
+        username: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        cleaned_group = normalize_group_key(group_key) if group_key else None
+        cleaned_user = str(username or "").strip() or None
+        with self.lock:
+            entries = [dict(item) for item in self.data.get("memberships", {}).values() if isinstance(item, dict)]
+        payload: List[Dict[str, Any]] = []
+        for entry in sorted(entries, key=lambda item: (str(item.get("group_key") or ""), str(item.get("username") or ""))):
+            if cleaned_group and str(entry.get("group_key") or "").strip().lower() != cleaned_group:
+                continue
+            if cleaned_user and str(entry.get("username") or "").strip() != cleaned_user:
+                continue
+            normalized = self._membership_payload(entry)
+            if normalized:
+                payload.append(normalized)
+        return payload
+
+    def upsert_group_membership(
+        self,
+        group_key: str,
+        username: str,
+        *,
+        membership_role: str = GROUP_MEMBERSHIP_ROLE_MEMBER,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cleaned_group = normalize_group_key(group_key)
+        cleaned_user = str(username or "").strip()
+        if not cleaned_user:
+            raise ValueError("username_required")
+        role_value = normalize_group_membership_role(membership_role)
+        now = self._timestamp_now()
+        with self.lock:
+            if cleaned_group not in self.data.get("groups", {}):
+                raise ValueError("group_not_found")
+            if not self.users.get_user(cleaned_user):
+                raise ValueError("user_not_found")
+            membership_id = self._membership_id(cleaned_group, cleaned_user)
+            existing = self.data.get("memberships", {}).get(membership_id) or {}
+            self.data.setdefault("memberships", {})[membership_id] = {
+                "group_key": cleaned_group,
+                "username": cleaned_user,
+                "membership_role": role_value,
+                "metadata": dict(metadata or {}),
+                "created_at": existing.get("created_at") or now,
+                "updated_at": now,
+            }
+            self._write()
+            entry = dict(self.data.get("memberships", {}).get(membership_id) or {})
+        membership = self._membership_payload(entry)
+        if not membership:
+            raise RuntimeError("group_membership_upsert_failed")
+        return membership
+
+    def delete_group_membership(self, group_key: str, username: str) -> bool:
+        cleaned_group = normalize_group_key(group_key)
+        cleaned_user = str(username or "").strip()
+        if not cleaned_user:
+            return False
+        with self.lock:
+            membership_id = self._membership_id(cleaned_group, cleaned_user)
+            if membership_id not in self.data.get("memberships", {}):
+                return False
+            self.data["memberships"].pop(membership_id, None)
+            self._write()
+        return True
+
+    def _upsert_service_locked(self, payload: Dict[str, Any]) -> None:
+        service_key = normalize_service_key(payload.get("service_key") or payload.get("key"))
+        existing = self.data.get("services", {}).get(service_key) or {}
+        metadata = payload.get("metadata")
+        if metadata is None and isinstance(existing.get("metadata"), dict):
+            metadata = dict(existing.get("metadata") or {})
+        now = self._timestamp_now()
+        self.data.setdefault("services", {})[service_key] = {
+            "service_key": service_key,
+            "display_name": str(payload.get("display_name") or existing.get("display_name") or service_key).strip() or service_key,
+            "description": str(
+                payload.get("description")
+                if payload.get("description") is not None
+                else existing.get("description") or ""
+            ).strip() or None,
+            "public_access_level": normalize_service_access_level(
+                payload.get("public_access_level"),
+                default=SERVICE_ACCESS_NONE,
+            ),
+            "dashboard_url": str(
+                payload.get("dashboard_url")
+                if payload.get("dashboard_url") is not None
+                else existing.get("dashboard_url") or ""
+            ).strip() or None,
+            "marketing_url": str(
+                payload.get("marketing_url")
+                if payload.get("marketing_url") is not None
+                else existing.get("marketing_url") or ""
+            ).strip() or None,
+            "metadata": dict(metadata or {}),
+            "created_at": existing.get("created_at") or now,
+            "updated_at": now,
+        }
+
+    def list_services(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            values = [dict(item) for item in self.data.get("services", {}).values() if isinstance(item, dict)]
+        payload: List[Dict[str, Any]] = []
+        for entry in sorted(values, key=lambda item: str(item.get("service_key") or "")):
+            normalized = self._service_payload(entry)
+            if normalized:
+                payload.append(normalized)
+        return payload
+
+    def get_service(self, service_key: str) -> Optional[Dict[str, Any]]:
+        cleaned = normalize_service_key(service_key)
+        with self.lock:
+            entry = dict(self.data.get("services", {}).get(cleaned) or {})
+        return self._service_payload(entry)
+
+    def upsert_service(
+        self,
+        service_key: str,
+        *,
+        display_name: Optional[str] = None,
+        description: Optional[str] = None,
+        public_access_level: str = SERVICE_ACCESS_NONE,
+        dashboard_url: Optional[str] = None,
+        marketing_url: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cleaned = normalize_service_key(service_key)
+        with self.lock:
+            self._upsert_service_locked(
+                {
+                    "service_key": cleaned,
+                    "display_name": display_name,
+                    "description": description,
+                    "public_access_level": public_access_level,
+                    "dashboard_url": dashboard_url,
+                    "marketing_url": marketing_url,
+                    "metadata": dict(metadata or {}) if metadata is not None else None,
+                }
+            )
+            self._write()
+            entry = dict(self.data.get("services", {}).get(cleaned) or {})
+        service = self._service_payload(entry)
+        if not service:
+            raise RuntimeError("service_upsert_failed")
+        return service
+
+    def _upsert_group_service_grant_locked(self, payload: Dict[str, Any]) -> None:
+        group_key = normalize_group_key(payload.get("group_key"))
+        service_key = normalize_service_key(payload.get("service_key"))
+        if group_key not in self.data.get("groups", {}):
+            raise ValueError("group_not_found")
+        if service_key not in self.data.get("services", {}):
+            raise ValueError("service_not_found")
+        existing = self.data.get("grants", {}).get(self._grant_id(group_key, service_key)) or {}
+        granted_by_raw = str(payload.get("granted_by") or "").strip() or None
+        if granted_by_raw and not self.users.get_user(granted_by_raw):
+            granted_by_raw = None
+        now = self._timestamp_now()
+        self.data.setdefault("grants", {})[self._grant_id(group_key, service_key)] = {
+            "group_key": group_key,
+            "service_key": service_key,
+            "access_level": normalize_service_access_level(payload.get("access_level")),
+            "granted_by": granted_by_raw,
+            "metadata": dict(payload.get("metadata") or {}),
+            "created_at": existing.get("created_at") or now,
+            "updated_at": now,
+        }
+
+    def list_group_service_grants(
+        self,
+        *,
+        group_key: Optional[str] = None,
+        service_key: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        cleaned_group = normalize_group_key(group_key) if group_key else None
+        cleaned_service = normalize_service_key(service_key) if service_key else None
+        with self.lock:
+            entries = [dict(item) for item in self.data.get("grants", {}).values() if isinstance(item, dict)]
+        payload: List[Dict[str, Any]] = []
+        for entry in sorted(entries, key=lambda item: (str(item.get("group_key") or ""), str(item.get("service_key") or ""))):
+            if cleaned_group and str(entry.get("group_key") or "").strip().lower() != cleaned_group:
+                continue
+            if cleaned_service and str(entry.get("service_key") or "").strip().lower() != cleaned_service:
+                continue
+            normalized = self._grant_payload(entry)
+            if normalized:
+                payload.append(normalized)
+        return payload
+
+    def get_group_service_grant(self, group_key: str, service_key: str) -> Optional[Dict[str, Any]]:
+        grants = self.list_group_service_grants(group_key=group_key, service_key=service_key)
+        return grants[0] if grants else None
+
+    def upsert_group_service_grant(
+        self,
+        group_key: str,
+        service_key: str,
+        *,
+        access_level: str,
+        granted_by: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cleaned_group = normalize_group_key(group_key)
+        cleaned_service = normalize_service_key(service_key)
+        with self.lock:
+            self._upsert_group_service_grant_locked(
+                {
+                    "group_key": cleaned_group,
+                    "service_key": cleaned_service,
+                    "access_level": access_level,
+                    "granted_by": granted_by,
+                    "metadata": dict(metadata or {}) if metadata is not None else None,
+                }
+            )
+            self._write()
+            entry = dict(self.data.get("grants", {}).get(self._grant_id(cleaned_group, cleaned_service)) or {})
+        grant = self._grant_payload(entry)
+        if not grant:
+            raise RuntimeError("group_service_grant_upsert_failed")
+        return grant
+
+    def delete_group_service_grant(self, group_key: str, service_key: str) -> bool:
+        cleaned_group = normalize_group_key(group_key)
+        cleaned_service = normalize_service_key(service_key)
+        with self.lock:
+            grant_id = self._grant_id(cleaned_group, cleaned_service)
+            if grant_id not in self.data.get("grants", {}):
+                return False
+            self.data["grants"].pop(grant_id, None)
+            self._write()
+        return True
+
+
+class FileServiceAccountStore:
+    def __init__(self, path: Path, users: FileUserStore, access: FileAccessControlStore):
+        self.path = path
+        self.users = users
+        self.access = access
+        self.lock = threading.RLock()
+        payload = _read_json(path, {"version": 1, "service_accounts": {}})
+        if not isinstance(payload, dict):
+            payload = {"version": 1, "service_accounts": {}}
+        if not isinstance(payload.get("service_accounts"), dict):
+            payload["service_accounts"] = {}
+        self.data = payload
+
+    def _write(self) -> None:
+        _write_json_atomic(self.path, self.data)
+
+    def _timestamp_now(self) -> str:
+        return _timestamp(dt.datetime.now(UTC)) or ""
+
+    @staticmethod
+    def _payload(entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(entry, dict):
+            return None
+        service_account_id = str(entry.get("service_account_id") or "").strip().lower()
+        principal_username = str(entry.get("principal_username") or "").strip()
+        if not service_account_id or not principal_username:
+            return None
+        return {
+            "service_account_id": service_account_id,
+            "principal_username": principal_username,
+            "display_name": str(entry.get("display_name") or service_account_id).strip() or service_account_id,
+            "description": str(entry.get("description") or "").strip() or None,
+            "service_key": str(entry.get("service_key") or "").strip().lower() or None,
+            "created_by": str(entry.get("created_by") or entry.get("created_by_username") or "").strip() or None,
+            "disabled": bool(entry.get("disabled")),
+            "metadata": dict(entry.get("metadata")) if isinstance(entry.get("metadata"), dict) else {},
+            "created_at": entry.get("created_at"),
+            "updated_at": entry.get("updated_at"),
+        }
+
+    def list_service_accounts(self, *, include_disabled: bool = False) -> List[Dict[str, Any]]:
+        with self.lock:
+            items = [dict(item) for item in self.data.get("service_accounts", {}).values() if isinstance(item, dict)]
+        payload: List[Dict[str, Any]] = []
+        for entry in sorted(items, key=lambda item: str(item.get("service_account_id") or "")):
+            normalized = self._payload(entry)
+            if not normalized:
+                continue
+            if normalized.get("disabled") and not include_disabled:
+                continue
+            payload.append(normalized)
+        return payload
+
+    def get_service_account(
+        self,
+        service_account_id: str,
+        *,
+        include_disabled: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        cleaned_id = normalize_service_account_id(service_account_id)
+        with self.lock:
+            entry = dict(self.data.get("service_accounts", {}).get(cleaned_id) or {})
+        normalized = self._payload(entry)
+        if normalized and (include_disabled or not normalized.get("disabled")):
+            return normalized
+        return None
+
+    def get_by_principal_username(
+        self,
+        principal_username: str,
+        *,
+        include_disabled: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        cleaned_principal = str(principal_username or "").strip()
+        if not cleaned_principal:
+            return None
+        with self.lock:
+            items = [dict(item) for item in self.data.get("service_accounts", {}).values() if isinstance(item, dict)]
+        for entry in items:
+            if str(entry.get("principal_username") or "").strip() != cleaned_principal:
+                continue
+            normalized = self._payload(entry)
+            if normalized and (include_disabled or not normalized.get("disabled")):
+                return normalized
+        return None
+
+    def upsert_service_account(
+        self,
+        service_account_id: str,
+        *,
+        display_name: Optional[str] = None,
+        description: Optional[str] = None,
+        service_key: Optional[str] = None,
+        created_by: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        disabled: bool = False,
+    ) -> Dict[str, Any]:
+        cleaned_id = normalize_service_account_id(service_account_id)
+        cleaned_service_key = None
+        if service_key not in (None, ""):
+            cleaned_service_key = normalize_service_key(service_key)
+            if not self.access.get_service(cleaned_service_key):
+                raise ValueError("service_not_found")
+        cleaned_created_by = str(created_by or "").strip() or None
+        if cleaned_created_by and not self.users.get_user(cleaned_created_by):
+            raise ValueError("created_by_not_found")
+        principal_username = service_account_principal_username(cleaned_id)
+        existing_user = self.users.get_user(principal_username)
+        if existing_user and not (
+            _is_service_account_provider(existing_user)
+            and str(existing_user.get("subject") or "").strip() == cleaned_id
+        ):
+            raise ValueError("principal_username_conflict")
+        self.users.upsert_external_user(
+            principal_username,
+            role="user",
+            provider=SERVICE_ACCOUNT_PROVIDER,
+            subject=cleaned_id,
+        )
+        now = self._timestamp_now()
+        with self.lock:
+            existing = dict(self.data.get("service_accounts", {}).get(cleaned_id) or {})
+            self.data.setdefault("service_accounts", {})[cleaned_id] = {
+                "service_account_id": cleaned_id,
+                "principal_username": principal_username,
+                "display_name": str(display_name or existing.get("display_name") or cleaned_id).strip() or cleaned_id,
+                "description": str(
+                    description if description is not None else existing.get("description") or ""
+                ).strip()
+                or None,
+                "service_key": cleaned_service_key or existing.get("service_key"),
+                "created_by": existing.get("created_by") or cleaned_created_by,
+                "disabled": bool(disabled),
+                "metadata": dict(metadata or existing.get("metadata") or {}),
+                "created_at": existing.get("created_at") or now,
+                "updated_at": now,
+            }
+            self._write()
+            entry = dict(self.data.get("service_accounts", {}).get(cleaned_id) or {})
+        account = self._payload(entry)
+        if not account:
+            raise RuntimeError("service_account_upsert_failed")
+        return account
+
+    def set_disabled(self, service_account_id: str, disabled: bool) -> Optional[Dict[str, Any]]:
+        cleaned_id = normalize_service_account_id(service_account_id)
+        now = self._timestamp_now()
+        with self.lock:
+            entry = self.data.get("service_accounts", {}).get(cleaned_id)
+            if not isinstance(entry, dict):
+                return None
+            entry["disabled"] = bool(disabled)
+            entry["updated_at"] = now
+            self._write()
+            updated = dict(entry)
+        return self._payload(updated)
+
+
 class FileTokenStore:
     """JSON-backed auth token store used when PostgreSQL is unavailable."""
 
@@ -2556,6 +4385,52 @@ class FileTokenStore:
                 }
         return None
 
+    def list_tokens(self, user: Optional[str] = None) -> List[Dict[str, Any]]:
+        cleaned_user = str(user or "").strip() or None
+        with self.lock:
+            tokens = [item for item in self.data.get("tokens", []) if isinstance(item, dict)]
+        rows: List[Dict[str, Any]] = []
+        for entry in tokens:
+            if entry.get("kind") != "access":
+                continue
+            if cleaned_user and str(entry.get("username") or "").strip() != cleaned_user:
+                continue
+            rows.append(
+                {
+                    "id": entry.get("id"),
+                    "user": entry.get("username"),
+                    "label": entry.get("label"),
+                    "created_at": entry.get("created_at"),
+                    "expires_at": entry.get("expires_at"),
+                    "last_used_at": entry.get("last_used_at"),
+                    "disabled": bool(entry.get("disabled")),
+                    "meta": dict(entry.get("meta") or {}),
+                }
+            )
+        rows.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return rows
+
+    def revoke(self, token_id: str) -> bool:
+        cleaned = str(token_id or "").strip()
+        if not cleaned:
+            return False
+        with self.lock:
+            tokens = [item for item in self.data.get("tokens", []) if isinstance(item, dict)]
+            updated = False
+            for entry in tokens:
+                if entry.get("id") != cleaned or entry.get("kind") != "access":
+                    continue
+                if entry.get("disabled"):
+                    break
+                entry["disabled"] = True
+                entry["updated_at"] = _timestamp(self._now())
+                updated = True
+                break
+            if updated:
+                self.data["tokens"] = tokens
+                self._write()
+            return updated
+
     def consume_one_time(self, kind: str, token: str) -> Optional[str]:
         cleaned = str(token or "").strip()
         if not cleaned:
@@ -2700,6 +4575,12 @@ class FileStoreBundle:
         self.base_dir = base
         self.users = FileUserStore(base / "users.json")
         self.teams = FileTeamStore(base / "teams.json", self.users)
+        self.access = FileAccessControlStore(base / "access_control.json", self.users)
+        self.service_accounts = FileServiceAccountStore(
+            base / "service_accounts.json",
+            self.users,
+            self.access,
+        )
         self.access_tokens = FileTokenStore(base / "auth_tokens.json")
         self.voice_tokens = FileVoiceTokenStore(self.access_tokens)
         self.sso_tokens = FileSsoStore(self.access_tokens)
@@ -2708,33 +4589,118 @@ class FileStoreBundle:
         return None
 
     def bootstrap_from_env(self, default_user: str = "") -> None:
+        self.access.bootstrap_contract()
+        raw_service_accounts = (
+            os.getenv("CUSTOMERS_BOOTSTRAP_SERVICE_ACCOUNTS")
+            or os.getenv("CUSTOMERS_SERVICE_ACCOUNTS_JSON")
+            or ""
+        ).strip()
+        if raw_service_accounts:
+            try:
+                service_accounts_payload = json.loads(raw_service_accounts)
+            except Exception:
+                service_accounts_payload = None
+            if isinstance(service_accounts_payload, list):
+                for item in service_accounts_payload:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        service_account_id = normalize_service_account_id(
+                            item.get("service_account_id") or item.get("id") or item.get("key")
+                        )
+                    except ValueError:
+                        continue
+                    try:
+                        account = self.service_accounts.upsert_service_account(
+                            service_account_id,
+                            display_name=str(
+                                item.get("display_name") or item.get("name") or service_account_id
+                            ).strip()
+                            or service_account_id,
+                            description=str(item.get("description") or "").strip() or None,
+                            service_key=item.get("service_key") or item.get("service"),
+                            created_by=item.get("created_by") or default_user or None,
+                            metadata=item.get("metadata") if isinstance(item.get("metadata"), dict) else None,
+                            disabled=bool(item.get("disabled")),
+                        )
+                    except ValueError:
+                        continue
+                    for group_key in _service_account_group_keys(item):
+                        try:
+                            self.access.upsert_group_membership(
+                                group_key,
+                                str(account.get("principal_username") or "").strip(),
+                                membership_role=GROUP_MEMBERSHIP_ROLE_MEMBER,
+                            )
+                        except ValueError:
+                            continue
         raw = (
             os.getenv("CUSTOMERS_BOOTSTRAP_ACCESS_TOKENS")
             or os.getenv("REFINER_BOOTSTRAP_ACCESS_TOKENS")
             or ""
         ).strip()
-        if not raw:
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = None
+            if isinstance(payload, list):
+                for item in payload:
+                    if not isinstance(item, dict):
+                        continue
+                    token = str(item.get("token") or "").strip()
+                    username = str(item.get("user") or default_user or "").strip()
+                    if not token or not username:
+                        continue
+                    role = str(item.get("role") or "user").strip() or "user"
+                    label = str(item.get("label") or "").strip() or None
+                    ttl_seconds = item.get("ttl_seconds")
+                    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+                    self.users.ensure_user(username, role=role)
+                    self.access_tokens.ensure_token(
+                        username,
+                        token,
+                        label=label,
+                        ttl_seconds=int(ttl_seconds) if ttl_seconds not in (None, "") else None,
+                        meta=meta,
+                    )
+        raw_service_account_tokens = (
+            os.getenv("CUSTOMERS_BOOTSTRAP_SERVICE_ACCOUNT_TOKENS")
+            or os.getenv("CUSTOMERS_SERVICE_ACCOUNT_TOKENS_JSON")
+            or ""
+        ).strip()
+        if not raw_service_account_tokens:
             return
         try:
-            payload = json.loads(raw)
+            service_account_token_payload = json.loads(raw_service_account_tokens)
         except Exception:
             return
-        if not isinstance(payload, list):
+        if not isinstance(service_account_token_payload, list):
             return
-        for item in payload:
+        for item in service_account_token_payload:
             if not isinstance(item, dict):
                 continue
             token = str(item.get("token") or "").strip()
-            username = str(item.get("user") or default_user or "").strip()
-            if not token or not username:
+            if not token:
                 continue
-            role = str(item.get("role") or "user").strip() or "user"
+            service_account_id_raw = item.get("service_account_id") or item.get("id") or item.get("key")
+            try:
+                service_account_id = normalize_service_account_id(service_account_id_raw)
+            except ValueError:
+                continue
+            account = self.service_accounts.get_service_account(service_account_id, include_disabled=True)
+            if not account:
+                continue
             label = str(item.get("label") or "").strip() or None
             ttl_seconds = item.get("ttl_seconds")
             meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-            self.users.ensure_user(username, role=role)
+            meta = {
+                **meta,
+                "identity_type": "service_account",
+                "service_account_id": service_account_id,
+            }
             self.access_tokens.ensure_token(
-                username,
+                str(account.get("principal_username") or "").strip(),
                 token,
                 label=label,
                 ttl_seconds=int(ttl_seconds) if ttl_seconds not in (None, "") else None,

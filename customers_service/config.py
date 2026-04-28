@@ -108,6 +108,11 @@ class Settings:
     app_tokens: Dict[str, str]
     allow_setup: bool
     self_registration_enabled: bool
+    auth_challenge_ttl_seconds: int
+    totp_issuer: str
+    passkey_rp_id: str
+    passkey_rp_name: str
+    passkey_allowed_origins: List[str]
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -191,4 +196,9 @@ class Settings:
             app_tokens=parse_app_tokens(env_first("CUSTOMERS_APP_TOKENS", default="")),
             allow_setup=env_bool("CUSTOMERS_ALLOW_SETUP", default=True),
             self_registration_enabled=env_bool("CUSTOMERS_SELF_REGISTRATION_ENABLED", default=False),
+            auth_challenge_ttl_seconds=max(60, env_int("CUSTOMERS_AUTH_CHALLENGE_TTL", default=300)),
+            totp_issuer=env_first("CUSTOMERS_TOTP_ISSUER", default="NeuralMimicry"),
+            passkey_rp_id=env_first("CUSTOMERS_PASSKEY_RP_ID", default=""),
+            passkey_rp_name=env_first("CUSTOMERS_PASSKEY_RP_NAME", default="NeuralMimicry"),
+            passkey_allowed_origins=env_list("CUSTOMERS_PASSKEY_ALLOWED_ORIGINS"),
         )

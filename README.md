@@ -1,7 +1,7 @@
 # Customers
 
 Customers is NeuralMimicry's dedicated identity service.
-It owns user registration, login, logout, browser sessions, SSO/OIDC exchange, profile management, and voice-token lifecycle.
+It owns user registration, login, logout, browser sessions, optional authenticator-app 2FA, passkey sign-in, SSO/OIDC exchange, profile management, and voice-token lifecycle.
 
 ## Why this repo exists
 
@@ -47,11 +47,15 @@ Customers owns:
 - first-user bootstrap and local account creation
 - admin-managed local user creation and password resets
 - password verification and login throttling
+- authenticator-app 2FA enrolment and verification for local accounts
+- passkey registration, passkey sign-in, and passkey lifecycle management for local accounts
 - self-service password changes
 - browser session cookies
 - SSO token issue/exchange
 - OIDC login and callback handling
 - user profile reads and updates
+- group and service catalog state
+- delegated group memberships and service grants
 - hierarchical team ownership and membership metadata
 - team invitations, acceptance/rejection, and leaving a team
 - voice-token issue, list, revoke, and internal resolution
@@ -80,11 +84,66 @@ Team collaboration is tracked separately from those global roles:
 Session, profile, and internal credential responses now include additive team/group context so downstream services can consume it without a second identity lookup.
 Profile and session responses also carry the validated `settings` block used by Refiner's Control Room so the public contract stays stable when auth/profile routes are proxied through Customers.
 
+## Authorisation model
+
+Customers is now the shared authorisation source of truth for the commercial stack as well as identity.
+
+Built-in groups:
+
+- `user`
+- `admin`
+
+Every account still has a top-level role (`user` or `admin`), and that role is treated as an implicit membership in the matching built-in group.
+Additional explicit group memberships are stored separately and can use one of two membership roles:
+
+- `member`
+- `manager`
+
+Service accounts are first-class principals for backend-to-backend calls.
+They:
+
+- are stored separately from human users
+- can join explicit groups and inherit only those group grants
+- can be issued normal Customers bearer tokens
+- resolve through `/api/session` with `identity_type: service_account` and `role: service_account`
+
+Service accounts do not inherit the built-in `user` group or any human fallback grants.
+
+Service access is managed through a service catalog plus group-scoped grants.
+Each service has a public visibility level:
+
+- `none`
+- `request`
+- `observe`
+- `use`
+- `control`
+
+Delegation rules:
+
+- platform admins can manage the entire group tree
+- group managers can manage the group they manage plus descendant groups
+- built-in system groups (`user`, `admin`) stay reserved for platform admins
+- child group direct grants are bounded by the parent group's effective grant for the same service
+- child groups do not inherit new services automatically; they must be granted explicitly, and those grants cannot exceed the parent
+
+This lets NeuralMimicry delegate billing/admin/customer capabilities hierarchically without letting a lower level exceed the one above it.
+
+Session/profile/internal identity payloads now include:
+
+- `group_memberships`
+- `manageable_groups`
+- `visible_groups`
+- `service_access`
+- `visible_services`
+
+Downstream services consume those resolved fields directly instead of reimplementing group and service policy.
+
 ## API surface
 
 HTML routes:
 
 - `GET /login`
+- `GET /register`
 - `GET /setup`
 - `GET /logout`
 - `GET /oidc/login`
@@ -99,12 +158,33 @@ Public JSON routes:
 - `POST /api/setup`
 - `POST /api/register`
 - `POST /api/login`
+- `POST /api/login/mfa/totp`
 - `POST /api/logout`
 - `GET /api/session`
 - `GET|POST /api/profile`
 - `POST /api/profile/password`
+- `POST /api/profile/mfa/totp/start`
+- `POST /api/profile/mfa/totp/verify`
+- `POST /api/profile/mfa/totp/disable`
+- `POST /api/profile/passkeys/register/options`
+- `POST /api/profile/passkeys/register/verify`
+- `DELETE /api/profile/passkeys/<credential_id>`
+- `POST /api/passkeys/authenticate/options`
+- `POST /api/passkeys/authenticate/verify`
 - `GET|POST /api/users`
 - `POST /api/users/<username>/password`
+- `GET /api/services`
+- `GET|POST /api/groups`
+- `GET /api/groups/<group_key>`
+- `POST /api/groups/<group_key>/members`
+- `DELETE /api/groups/<group_key>/members/<username>`
+- `POST /api/groups/<group_key>/grants`
+- `DELETE /api/groups/<group_key>/grants/<service_key>`
+- `GET|POST /api/service-accounts`
+- `GET /api/service-accounts/<service_account_id>`
+- `POST /api/service-accounts/<service_account_id>/tokens`
+- `DELETE /api/service-accounts/<service_account_id>/tokens/<token_id>`
+- `POST /api/service-accounts/<service_account_id>/disable`
 - `GET|POST /api/teams`
 - `GET /api/teams/<team_id>`
 - `POST /api/teams/<team_id>/invite`
@@ -117,10 +197,11 @@ Public JSON routes:
 - `GET|POST /api/voice/tokens`
 - `DELETE /api/voice/tokens/<token_id>`
 
-Internal JSON routes protected by app tokens:
+Internal JSON routes protected by trusted internal bearer tokens:
 
 - `POST /api/internal/voice/resolve`
 - `POST /api/internal/credentials/verify`
+- `GET /api/internal/users/<username>`
 
 ## Storage model
 
@@ -143,6 +224,11 @@ Relevant tables created in Postgres include:
 - `nm_users`
 - `nm_teams`
 - `nm_team_memberships`
+- `nm_groups`
+- `nm_group_memberships`
+- `nm_service_catalog`
+- `nm_group_service_grants`
+- `nm_service_accounts`
 - `nm_auth_tokens`
 - `nm_token_accounts`
 - `nm_token_ledger_entries`
@@ -173,6 +259,16 @@ Core runtime variables:
 - `CUSTOMERS_PASSWORD_MIN_LENGTH`
 - `CUSTOMERS_ALLOW_SETUP`
 - `CUSTOMERS_SELF_REGISTRATION_ENABLED`
+- `CUSTOMERS_AUTH_CHALLENGE_TTL`
+- `CUSTOMERS_TOTP_ISSUER`
+- `CUSTOMERS_PASSKEY_RP_ID`
+- `CUSTOMERS_PASSKEY_RP_NAME`
+- `CUSTOMERS_PASSKEY_ALLOWED_ORIGINS`
+- `CUSTOMERS_BOOTSTRAP_GROUPS`
+- `CUSTOMERS_BOOTSTRAP_SERVICE_CATALOG`
+- `CUSTOMERS_BOOTSTRAP_GROUP_SERVICE_GRANTS`
+- `CUSTOMERS_BOOTSTRAP_SERVICE_ACCOUNTS`
+- `CUSTOMERS_BOOTSTRAP_SERVICE_ACCOUNT_TOKENS`
 - `CUSTOMERS_SESSION_COOKIE_NAME`
 - `CUSTOMERS_COOKIE_DOMAIN`
 - `CUSTOMERS_COOKIE_SAMESITE`
@@ -235,6 +331,11 @@ Run with the file-backed store:
 ```bash
 export CUSTOMERS_SECRET_KEY='change-me'
 export CUSTOMERS_APP_TOKENS='refiner=dev-refiner-token,billing=dev-billing-token'
+export CUSTOMERS_BOOTSTRAP_GROUPS='[{"key":"user","name":"User","system":true},{"key":"admin","name":"Admin","system":true}]'
+export CUSTOMERS_BOOTSTRAP_SERVICE_CATALOG='[{"service_key":"refiner","display_name":"Refiner","public_access_level":"request"},{"service_key":"billing","display_name":"Billing","public_access_level":"none"}]'
+export CUSTOMERS_BOOTSTRAP_GROUP_SERVICE_GRANTS='[{"group_key":"user","service_key":"refiner","access_level":"use"},{"group_key":"user","service_key":"billing","access_level":"use"}]'
+export CUSTOMERS_BOOTSTRAP_SERVICE_ACCOUNTS='[{"service_account_id":"conductor-sync","display_name":"Conductor Sync","service_key":"conductor","groups":["admin"]}]'
+export CUSTOMERS_BOOTSTRAP_SERVICE_ACCOUNT_TOKENS='[{"service_account_id":"conductor-sync","token":"dev-conductor-service-token","label":"bootstrap-conductor"}]'
 python -m customers_service
 ```
 
@@ -264,8 +365,9 @@ Deployment defaults assume:
 
 - internal service URL `http://customers.customers.svc.cluster.local:5010`
 - shared Postgres service `postgres.postgres.svc.cluster.local:5432`
-- generated app tokens for `refiner` and `billing`
-- optional nmchain token loaded from `.secrets/nmchain/<inventory-host>/customers_api_token`
+- generated app tokens for `refiner` and `billing` remain available for compatibility allow-lists
+- Customers bootstraps managed backend service accounts and writes their bearer tokens under `.secrets/customers/<inventory-host>/<service>_access_token`
+- Customers uses its own Customers-issued service-account token for nmchain by default
 - persistent NFS-backed state PVC for local-store fallback and SSO artifacts
 
 ## Interoperability contract
@@ -274,7 +376,7 @@ For the split platform to be fully functional:
 
 - Refiner should point `REFINER_CUSTOMERS_API_BASE` at Customers
 - Billing should point `BILLING_CUSTOMERS_API_BASE` at Customers
-- Refiner and Billing should use the Customers-generated app tokens for their protected internal routes
+- Refiner and Billing should use their own Customers-issued service-account tokens for protected internal routes
 - nmchain should use Customers for session resolution, not Refiner
 
 See also:

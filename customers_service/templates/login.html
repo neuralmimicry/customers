@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="rag-api-base" content="{{ api_base or '' }}">
-  <title>NeuralMimicry Customers Login</title>
+  <title>NeuralMimicry Customers Sign in</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
@@ -12,19 +12,65 @@
     <section class="card auth-card">
       <p class="eyebrow">NeuralMimicry Customers</p>
       <h1>Sign in</h1>
-      <p class="subtitle">Authenticate once, then access Refiner, billing, and other NeuralMimicry services through the shared session.</p>
+      <p class="subtitle">Sign in once, then access the NeuralMimicry services your group has been granted through the shared session.</p>
       <p id="authError" class="auth-error" {% if not error %}hidden{% endif %}>{{ error }}</p>
       {% if local_enabled %}
-      <form id="authForm" data-auth="login" data-next="{{ next_path or '/' }}" method="post" class="auth-form">
-        <label class="field">
-          <span>Username</span>
-          <input id="username" name="username" type="text" required autocomplete="username">
-        </label>
-        <label class="field">
-          <span>Password</span>
-          <input id="password" name="password" type="password" required autocomplete="current-password">
-        </label>
-        <button type="submit" class="primary">Login</button>
+      <form
+        id="authForm"
+        data-auth="login"
+        data-next="{{ next_path or '/' }}"
+        data-password-min-length="{{ password_min_length }}"
+        data-passkeys-supported="{{ 'true' if passkeys_supported else 'false' }}"
+        method="post"
+        class="auth-form"
+      >
+        <div id="passwordStep" class="auth-step" {% if mfa_required %}hidden{% endif %}>
+          <label class="field">
+            <span>Username</span>
+            <input
+              id="username"
+              name="username"
+              type="text"
+              required
+              autocomplete="username webauthn"
+              value="{{ pending_username or '' }}"
+            >
+          </label>
+          <label class="field">
+            <span>Password</span>
+            <input id="password" name="password" type="password" required autocomplete="current-password">
+          </label>
+          <div class="button-row">
+            <button type="submit" class="primary">Sign in</button>
+            <button
+              type="button"
+              id="passkeySignInBtn"
+              class="secondary"
+              {% if not passkeys_supported %}hidden{% endif %}
+            >
+              Use a passkey
+            </button>
+          </div>
+        </div>
+        <div id="totpStep" class="auth-step" {% if not mfa_required %}hidden{% endif %}>
+          <p class="hint security-copy">Enter the six-digit code from your authenticator app to finish signing in.</p>
+          <label class="field">
+            <span>Authenticator code</span>
+            <input
+              id="totpCode"
+              name="totp_code"
+              type="text"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              pattern="[0-9]{6}"
+              maxlength="8"
+            >
+          </label>
+          <div class="button-row">
+            <button type="submit" class="primary">Verify code</button>
+            <button type="button" id="backToPasswordBtn" class="secondary">Back</button>
+          </div>
+        </div>
       </form>
       {% endif %}
       {% if oidc_enabled %}
@@ -33,8 +79,11 @@
       {% endif %}
       <a class="primary auth-link" href="{{ url_for('oidc_login', next=(next_path or '/')) }}">{{ oidc_label }}</a>
       {% endif %}
+      {% if self_registration_enabled %}
+      <p class="hint auth-footnote">Need an account? <a class="inline-link" href="{{ url_for('register', next=(next_path or '/')) }}">Create one</a>.</p>
+      {% endif %}
       {% if not local_enabled and not oidc_enabled %}
-      <p class="hint">No authentication providers are available yet.</p>
+      <p class="hint">No sign-in providers are available yet.</p>
       {% endif %}
     </section>
   </main>
