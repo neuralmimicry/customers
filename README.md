@@ -318,10 +318,12 @@ Audit integration:
 
 ## Local development
 
+Customers targets Python 3.13.
+
 Create a virtual environment and install the package:
 
 ```bash
-python3 -m venv .venv
+python3.13 -m venv .venv
 . .venv/bin/activate
 pip install -e .[dev]
 ```

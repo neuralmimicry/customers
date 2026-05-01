@@ -19,17 +19,44 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Select Python provisioning
+        id: python-provision
+        run: |
+          source /etc/os-release
+          if [ "$(uname -m)" = "x86_64" ] && [ "$ID" = "ubuntu" ] && [ "$VERSION_ID" = "25.04" ]; then
+            echo "mode=system" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=setup-python" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup Python
+        if: steps.python-provision.outputs.mode == 'setup-python'
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
           cache: pip
           cache-dependency-path: pyproject.toml
 
+      - name: Select Python binary
+        run: |
+          if [ "${{ steps.python-provision.outputs.mode }}" = "system" ]; then
+            python3 - <<'PY'
+            import sys
+
+            if sys.version_info[:2] != (3, 13):
+                raise SystemExit(f"Python 3.13 required, found {sys.version}")
+            print(sys.version)
+            PY
+            echo "PYTHON_BIN=python3" >> "$GITHUB_ENV"
+          else
+            python --version
+            echo "PYTHON_BIN=python" >> "$GITHUB_ENV"
+          fi
+
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e .[dev]
+          "$PYTHON_BIN" -m pip install --upgrade pip
+          "$PYTHON_BIN" -m pip install -e .[dev]
 
       - name: Run tests
-        run: pytest -q
+        run: "$PYTHON_BIN" -m pytest -q
