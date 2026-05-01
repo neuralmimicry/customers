@@ -40,12 +40,14 @@ jobs:
       - name: Select Python binary
         run: |
           if [ "${{ steps.python-provision.outputs.mode }}" = "system" ]; then
-            PYTHON_BIN=python3
+            SOURCE_PYTHON=python3
           else
-            PYTHON_BIN=python
+            SOURCE_PYTHON=python
           fi
-          "$PYTHON_BIN" -c 'import sys; sys.exit(f"Python 3.13 required, found {sys.version}") if sys.version_info[:2] != (3, 13) else print(sys.version)'
-          echo "PYTHON_BIN=$PYTHON_BIN" >> "$GITHUB_ENV"
+          "$SOURCE_PYTHON" -c 'import sys; sys.exit(f"Python 3.13 required, found {sys.version}") if sys.version_info[:2] != (3, 13) else print(sys.version)'
+          VENV_DIR="$RUNNER_TEMP/customers-venv"
+          "$SOURCE_PYTHON" -m venv "$VENV_DIR"
+          echo "PYTHON_BIN=$VENV_DIR/bin/python" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: |
