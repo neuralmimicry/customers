@@ -133,6 +133,15 @@ DEFAULT_SERVICE_CATALOG: Sequence[Dict[str, Any]] = (
         "metadata": {"category": "internal"},
     },
     {
+        "service_key": "gail_trading",
+        "display_name": "Gail Trading",
+        "description": "Gail-managed trading bridge status and controls.",
+        "public_access_level": SERVICE_ACCESS_NONE,
+        "dashboard_url": "https://api.neuralmimicry.ai/services/health/monitoring#gail-trading",
+        "marketing_url": "/gail",
+        "metadata": {"category": "platform"},
+    },
+    {
         "service_key": "nmstt",
         "display_name": "nmstt",
         "description": "Speech-to-text runtime service.",

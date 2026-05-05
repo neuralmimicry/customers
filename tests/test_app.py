@@ -615,6 +615,11 @@ def test_profile_settings_roundtrip_preserves_email(monkeypatch, tmp_path):
         json={
             "settings": {
                 "assistant": {"use_memory": False},
+                "llm": {
+                    "provider_access": {
+                        "openai": {"mode": "user_key", "acknowledged": True},
+                    }
+                },
                 "solver": {"command_policy_mode": "strict"},
             }
         },
@@ -623,12 +628,20 @@ def test_profile_settings_roundtrip_preserves_email(monkeypatch, tmp_path):
     update_payload = update_response.get_json()
     assert update_payload["email"] == "alice@example.com"
     assert update_payload["settings"]["assistant"]["use_memory"] is False
+    assert update_payload["settings"]["llm"]["provider_access"]["openai"] == {
+        "mode": "user_key",
+        "acknowledged": True,
+    }
     assert update_payload["settings"]["solver"]["command_policy_mode"] == "strict"
 
     session_response = client.get("/api/session")
     assert session_response.status_code == 200
     session_payload = session_response.get_json()
     assert session_payload["settings"]["assistant"]["use_memory"] is False
+    assert session_payload["settings"]["llm"]["provider_access"]["openai"] == {
+        "mode": "user_key",
+        "acknowledged": True,
+    }
     assert session_payload["settings"]["solver"]["command_policy_mode"] == "strict"
 
     invalid_response = client.post(
@@ -639,6 +652,15 @@ def test_profile_settings_roundtrip_preserves_email(monkeypatch, tmp_path):
     invalid_payload = invalid_response.get_json()
     assert invalid_payload["error"] == "invalid_settings"
     assert invalid_payload["details"]
+
+    invalid_provider_access_response = client.post(
+        "/api/profile",
+        json={"settings": {"llm": {"provider_access": {"openai": {"mode": "invalid"}}}}},
+    )
+    assert invalid_provider_access_response.status_code == 400
+    invalid_provider_access_payload = invalid_provider_access_response.get_json()
+    assert invalid_provider_access_payload["error"] == "invalid_settings"
+    assert invalid_provider_access_payload["details"]
 
 
 def test_default_session_exposes_service_access_contract(monkeypatch, tmp_path):
@@ -663,6 +685,7 @@ def test_default_session_exposes_service_access_contract(monkeypatch, tmp_path):
     assert login_payload["service_access"]["continuum"]["visible"] is True
     assert login_payload["service_access"]["continuum"]["can_observe"] is True
     assert login_payload["service_access"]["gail"]["visible"] is False
+    assert login_payload["service_access"]["gail_trading"]["visible"] is False
 
 
 def test_services_and_groups_apis_reflect_visibility(monkeypatch, tmp_path):

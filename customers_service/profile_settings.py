@@ -18,6 +18,8 @@ SETTINGS_VERSION = 1
 ALLOWED_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh"}
 ALLOWED_ASSISTANT_PROFILES = {"requirements", "marketing"}
 ALLOWED_COMMAND_POLICY_MODES = {"standard", "strict"}
+ALLOWED_LLM_PROVIDER_ACCESS_MODES = {"service", "user_key"}
+ALLOWED_LLM_PROVIDER_ACCESS_PROVIDERS = {"openai", "gemini", "nvidia"}
 
 _DEFAULT_SETTINGS: Dict[str, Any] = {
     "version": SETTINGS_VERSION,
@@ -25,6 +27,11 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
         "default_provider": None,
         "default_model": None,
         "default_reasoning_effort": "medium",
+        "provider_access": {
+            "openai": {"mode": "service", "acknowledged": False},
+            "gemini": {"mode": "service", "acknowledged": False},
+            "nvidia": {"mode": "service", "acknowledged": False},
+        },
     },
     "assistant": {
         "default_profile": "requirements",
@@ -78,6 +85,17 @@ def _normalize_bool(value: Any) -> bool:
     raise ValueError("expected a boolean value")
 
 
+def _normalize_llm_provider_key(value: Any) -> str:
+    cleaned = str(value or "").strip().lower()
+    if cleaned in {"gpt", "chatgpt"}:
+        return "openai"
+    if cleaned == "google":
+        return "gemini"
+    if cleaned in {"nim", "nvidia_nim"}:
+        return "nvidia"
+    return cleaned
+
+
 def _strict_group(value: Any, path: str) -> Dict[str, Any]:
     if value is None:
         return {}
@@ -87,7 +105,7 @@ def _strict_group(value: Any, path: str) -> Dict[str, Any]:
 
 
 def _apply_llm_settings(target: Dict[str, Any], raw: Dict[str, Any], *, issues: List[str], strict: bool) -> None:
-    allowed = {"default_provider", "default_model", "default_reasoning_effort"}
+    allowed = {"default_provider", "default_model", "default_reasoning_effort", "provider_access"}
     for key, value in raw.items():
         if key not in allowed:
             if strict:
@@ -106,6 +124,36 @@ def _apply_llm_settings(target: Dict[str, Any], raw: Dict[str, Any], *, issues: 
                     max_length=128,
                     allowed_chars="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-/+",
                 )
+            elif key == "provider_access":
+                if not isinstance(value, dict):
+                    raise ValueError("expected an object")
+                for provider_key, provider_value in value.items():
+                    normalized_provider = _normalize_llm_provider_key(provider_key)
+                    if normalized_provider not in ALLOWED_LLM_PROVIDER_ACCESS_PROVIDERS:
+                        raise ValueError(
+                            "provider must be one of "
+                            f"{sorted(ALLOWED_LLM_PROVIDER_ACCESS_PROVIDERS)}"
+                        )
+                    if not isinstance(provider_value, dict):
+                        raise ValueError(f"{normalized_provider} must be an object")
+                    supported_provider_fields = {"mode", "acknowledged"}
+                    for provider_field, provider_field_value in provider_value.items():
+                        if provider_field not in supported_provider_fields:
+                            raise ValueError(
+                                f"{normalized_provider}.{provider_field} is not supported"
+                            )
+                        if provider_field == "mode":
+                            cleaned_mode = str(provider_field_value or "").strip().lower()
+                            if cleaned_mode not in ALLOWED_LLM_PROVIDER_ACCESS_MODES:
+                                raise ValueError(
+                                    f"{normalized_provider}.mode expected one of "
+                                    f"{sorted(ALLOWED_LLM_PROVIDER_ACCESS_MODES)}"
+                                )
+                            target["llm"]["provider_access"][normalized_provider]["mode"] = cleaned_mode
+                        else:
+                            target["llm"]["provider_access"][normalized_provider]["acknowledged"] = _normalize_bool(
+                                provider_field_value
+                            )
             else:
                 cleaned = str(value).strip().lower() if value is not None else ""
                 if cleaned not in ALLOWED_REASONING_EFFORTS:
@@ -232,3 +280,20 @@ def metadata_with_settings(
     if updated_at:
         merged[SETTINGS_UPDATED_AT_KEY] = str(updated_at)
     return merged
+
+
+def llm_provider_access_from_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    normalized = normalize_stored_settings(settings)
+    llm_cfg = normalized.get("llm") if isinstance(normalized.get("llm"), dict) else {}
+    raw_access = llm_cfg.get("provider_access") if isinstance(llm_cfg.get("provider_access"), dict) else {}
+    access: Dict[str, Dict[str, Any]] = {}
+    for provider in sorted(ALLOWED_LLM_PROVIDER_ACCESS_PROVIDERS):
+        entry = raw_access.get(provider) if isinstance(raw_access.get(provider), dict) else {}
+        mode = str(entry.get("mode") or "service").strip().lower()
+        if mode not in ALLOWED_LLM_PROVIDER_ACCESS_MODES:
+            mode = "service"
+        access[provider] = {
+            "mode": mode,
+            "acknowledged": bool(entry.get("acknowledged", False)),
+        }
+    return access
