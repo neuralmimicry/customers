@@ -11,6 +11,7 @@ from customers_service.app import create_app
 
 def _build_app(monkeypatch, tmp_path, *, self_registration=False):
     monkeypatch.setenv("CUSTOMERS_SECRET_KEY", "test-secret-key")
+    monkeypatch.setenv("CUSTOMERS_VERSION", "0.1.0-test")
     monkeypatch.setenv("CUSTOMERS_APP_TOKENS", "refiner=test-refiner-token,billing=test-billing-token")
     monkeypatch.setenv("CUSTOMERS_STATE_DIR", str(tmp_path / "customers-state"))
     monkeypatch.setenv("CUSTOMERS_ALLOW_SETUP", "1")
@@ -205,6 +206,7 @@ def test_login_and_registration_pages_include_totp_and_passkey_options(monkeypat
     assert "Optional sign-in security" in setup_html
     assert "Enable authenticator-app 2FA after setup" in setup_html
     assert "Register a passkey on this device" in setup_html
+    assert "Version 0.1.0-test" in setup_html
 
     setup_client = app.test_client()
     _setup_admin(setup_client)
@@ -215,12 +217,14 @@ def test_login_and_registration_pages_include_totp_and_passkey_options(monkeypat
     assert "Use a passkey" in login_html
     assert "Authenticator code" in login_html
     assert "Create one" in login_html
+    assert "Version 0.1.0-test" in login_html
 
     register_page = app.test_client().get("/register")
     assert register_page.status_code == 200
     register_html = register_page.get_data(as_text=True)
     assert "Enable authenticator-app 2FA after registration" in register_html
     assert "Register a passkey on this device" in register_html
+    assert "Version 0.1.0-test" in register_html
 
 
 def test_totp_setup_and_login_flow(monkeypatch, tmp_path):

@@ -1954,6 +1954,13 @@ def create_app() -> Flask:
     def _after_request(response: Response) -> Response:
         return _apply_cors(response)
 
+    @app.context_processor
+    def _template_context() -> Dict[str, Any]:
+        return {
+            "customers_version": settings.version,
+            "customers_service_name": settings.service_name,
+        }
+
     @app.route("/")
     def index() -> Response:
         return redirect(url_for("login"))
@@ -3724,4 +3731,5 @@ def main() -> None:
     )
     app = create_app()
     settings = app.extensions["nm_settings"]
+    logger.info("starting %s version=%s", settings.service_name, settings.version)
     app.run(host=settings.host, port=settings.port)

@@ -1,0 +1,210 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional semver override (X.Y.Z)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+
+      - name: Resolve release version
+        id: version
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          override="$(printf "%s" "${VERSION_OVERRIDE:-}" | tr -d '[:space:]')"
+
+          if [ -n "$override" ]; then
+            if ! printf "%s" "$override" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "Invalid override version '$override' (expected X.Y.Z)"
+              exit 1
+            fi
+            tag="v${override}"
+            if git rev-parse "$tag" >/dev/null 2>&1; then
+              echo "version=${override}" >>"$GITHUB_OUTPUT"
+              echo "tag=${tag}" >>"$GITHUB_OUTPUT"
+              echo "tag_created=false" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git tag -a "$tag" -m "Release ${tag}"
+            git push origin "$tag"
+            echo "version=${override}" >>"$GITHUB_OUTPUT"
+            echo "tag=${tag}" >>"$GITHUB_OUTPUT"
+            echo "tag_created=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          current_tag="$(git tag --points-at HEAD --list 'v*.*.*' --sort=-v:refname | head -n1 || true)"
+          if [ -n "$current_tag" ]; then
+            echo "version=${current_tag#v}" >>"$GITHUB_OUTPUT"
+            echo "tag=${current_tag}" >>"$GITHUB_OUTPUT"
+            echo "tag_created=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          latest_tag="$(git tag --list 'v*.*.*' --sort=-v:refname | head -n1 || true)"
+          if [ -z "$latest_tag" ]; then
+            next_version="0.1.0"
+          else
+            range="${latest_tag}..HEAD"
+            subjects="$(git log --format='%s' "$range")"
+            bodies="$(git log --format='%b' "$range")"
+            base="${latest_tag#v}"
+            major="${base%%.*}"
+            remainder="${base#*.}"
+            minor="${remainder%%.*}"
+            patch="${base##*.}"
+
+            bump="patch"
+            if printf "%s\n%s\n" "$subjects" "$bodies" | grep -Eq 'BREAKING CHANGE'; then
+              bump="major"
+            elif printf "%s" "$subjects" | grep -Eq '^[^:]+!:'; then
+              bump="major"
+            elif printf "%s" "$subjects" | grep -Eiq '^feat(\([^)]+\))?:'; then
+              bump="minor"
+            fi
+
+            case "$bump" in
+              major)
+                major=$((major + 1))
+                minor=0
+                patch=0
+                ;;
+              minor)
+                minor=$((minor + 1))
+                patch=0
+                ;;
+              *)
+                patch=$((patch + 1))
+                ;;
+            esac
+
+            next_version="${major}.${minor}.${patch}"
+          fi
+
+          tag="v${next_version}"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "version=${next_version}" >>"$GITHUB_OUTPUT"
+            echo "tag=${tag}" >>"$GITHUB_OUTPUT"
+            echo "tag_created=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git tag -a "$tag" -m "Release ${tag}"
+          git push origin "$tag"
+          echo "version=${next_version}" >>"$GITHUB_OUTPUT"
+          echo "tag=${tag}" >>"$GITHUB_OUTPUT"
+          echo "tag_created=true" >>"$GITHUB_OUTPUT"
+
+      - name: Build source and wheel artifacts
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          REPO_DIR="$PWD"
+          BUILD_WORKDIR="$(mktemp -d)"
+          BUILD_SOURCE="$BUILD_WORKDIR/source"
+          mkdir -p "$BUILD_SOURCE"
+          cp -a "$REPO_DIR/." "$BUILD_SOURCE/"
+          find "$BUILD_SOURCE" -type d -name "__pycache__" -prune -exec rm -rf {} +
+          find "$BUILD_SOURCE" -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
+          cd "$BUILD_WORKDIR"
+          python -m build --sdist --wheel --outdir "$REPO_DIR/dist" "$BUILD_SOURCE"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: customers-dist-${{ steps.version.outputs.tag }}
+          path: dist/*
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image name
+        id: image
+        run: |
+          echo "name=$(echo "ghcr.io/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          push: true
+          build-args: |
+            CUSTOMERS_VERSION=${{ steps.version.outputs.version }}
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ steps.version.outputs.version }}
+            ${{ steps.image.outputs.name }}:${{ steps.version.outputs.tag }}
+            ${{ steps.image.outputs.name }}:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "Customers ${VERSION}" --generate-notes
+          fi
+
+      - name: Publish to PyPI
+        if: ${{ secrets.PYPI_API_TOKEN != '' }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          python -m pip install twine
+          python -m twine upload dist/*

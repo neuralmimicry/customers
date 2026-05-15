@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version as package_version
 from typing import Dict, List, Optional
 
 
@@ -58,6 +59,13 @@ def parse_app_tokens(raw: str) -> Dict[str, str]:
         if app_id and token:
             tokens[app_id] = token
     return tokens
+
+
+def _default_service_version() -> str:
+    try:
+        return package_version("neuralmimicry-customers")
+    except PackageNotFoundError:
+        return "0.1.0"
 
 
 @dataclass(slots=True)
@@ -146,7 +154,7 @@ class Settings:
 
         return cls(
             service_name=env_first("CUSTOMERS_SERVICE_NAME", default="customers"),
-            version=env_first("CUSTOMERS_VERSION", default="0.1.0"),
+            version=env_first("CUSTOMERS_VERSION", default=_default_service_version()),
             host=env_first("CUSTOMERS_HOST", default="0.0.0.0"),
             port=env_int("CUSTOMERS_PORT", default=5010),
             secret_key=secret_key,

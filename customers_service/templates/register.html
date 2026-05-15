@@ -95,6 +95,7 @@
         </div>
       </section>
       <p class="hint auth-footnote">Already have an account? <a class="inline-link" href="{{ url_for('login', next=(next_path or '/')) }}">Sign in</a>.</p>
+      <p class="version-note">Version {{ customers_version }}</p>
     </section>
   </main>
   <script src="{{ url_for('static', filename='auth.js') }}"></script>

@@ -57,3 +57,16 @@ jobs:
       - name: Run tests
         run: |
           "$PYTHON_BIN" -m pytest -q
+
+      - name: Build package
+        run: |
+          "$PYTHON_BIN" -m pip install build
+          REPO_DIR="$PWD"
+          BUILD_WORKDIR="$(mktemp -d)"
+          BUILD_SOURCE="$BUILD_WORKDIR/source"
+          mkdir -p "$BUILD_SOURCE"
+          cp -a "$REPO_DIR/." "$BUILD_SOURCE/"
+          find "$BUILD_SOURCE" -type d -name "__pycache__" -prune -exec rm -rf {} +
+          find "$BUILD_SOURCE" -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
+          cd "$BUILD_WORKDIR"
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+ci" "$PYTHON_BIN" -m build --sdist --wheel --outdir "$REPO_DIR/dist" "$BUILD_SOURCE"

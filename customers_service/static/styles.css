@@ -201,6 +201,13 @@ input:focus {
   margin-top: 1.25rem;
 }
 
+.version-note {
+  margin: 1.4rem 0 0;
+  font-size: 0.74rem;
+  color: rgba(100, 86, 71, 0.9);
+  text-align: right;
+}
+
 .inline-link {
   color: var(--accent-strong);
   font-weight: 700;
