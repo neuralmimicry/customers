@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
@@ -29,7 +30,7 @@ class NmChainClient:
         self.app_id = app_id.strip() or "refiner"
         self.api_token = (api_token or "").strip() or None
         self.timeout = max(1.0, float(timeout))
-        self._session = requests.Session()
+        self._thread_local = threading.local()
 
     @classmethod
     def from_env(cls) -> Optional["NmChainClient"]:
@@ -188,7 +189,7 @@ class NmChainClient:
 
         url = f"{self.base_url}{path if path.startswith('/') else '/' + path}"
         try:
-            response = self._session.request(
+            response = self._session().request(
                 method=method.upper(),
                 url=url,
                 headers=headers,
@@ -213,6 +214,13 @@ class NmChainClient:
         if not isinstance(payload, dict):
             raise NmChainError("nmchain response was not a JSON object")
         return payload
+
+    def _session(self) -> requests.Session:
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._thread_local.session = session
+        return session
 
 
 def _env_first(*names: str, default: str = "") -> str:

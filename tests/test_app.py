@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import pyotp
 
 import customers_service.app as customers_app
@@ -75,6 +78,48 @@ def _add_group_member(client, group_key, username, *, membership_role="member"):
 
 def _login(client, username, password):
     return client.post("/api/login", json={"username": username, "password": password})
+
+
+def test_nmchain_events_are_non_blocking_and_parallel(monkeypatch, tmp_path):
+    app = _build_app(monkeypatch, tmp_path)
+
+    class _BlockingNmChain:
+        def __init__(self):
+            self.identity_started = threading.Event()
+            self.login_started = threading.Event()
+            self.release = threading.Event()
+
+        def upsert_identity(self, *_args, **_kwargs):
+            self.identity_started.set()
+            self.release.wait(timeout=3.0)
+            return {"status": "ok"}
+
+        def observe_login(self, *_args, **_kwargs):
+            self.login_started.set()
+            self.release.wait(timeout=3.0)
+            return {"status": "ok"}
+
+    chain = _BlockingNmChain()
+    app.extensions["nmchain"] = chain
+    client = app.test_client()
+
+    start = time.perf_counter()
+    response = client.post(
+        "/api/setup",
+        json={
+            "username": "alice",
+            "password": "correct horse battery staple",
+            "confirm": "correct horse battery staple",
+            "email": "alice@example.com",
+        },
+    )
+    elapsed = time.perf_counter() - start
+
+    assert response.status_code == 201
+    assert elapsed < 1.0
+    assert chain.identity_started.wait(timeout=1.0)
+    assert chain.login_started.wait(timeout=1.0)
+    chain.release.set()
 
 
 def test_health_reports_service_state(monkeypatch, tmp_path):

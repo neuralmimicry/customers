@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import atexit
 import base64
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -81,7 +83,8 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 LOGIN_MAX_ATTEMPTS = int(os.getenv("CUSTOMERS_LOGIN_MAX_ATTEMPTS") or "6")
 LOGIN_WINDOW_SEC = int(os.getenv("CUSTOMERS_LOGIN_WINDOW_SEC") or "600")
 
-_OIDC_CACHE: Dict[str, Any] = {"ts": 0.0, "config": None, "jwks": None}
+_OIDC_CACHE: Dict[str, Any] = {"config_ts": 0.0, "jwks_ts": 0.0, "config": None, "jwks": None}
+_OIDC_CACHE_LOCK = threading.Lock()
 _LOGIN_ATTEMPTS: Dict[str, List[float]] = {}
 _LOGIN_ATTEMPTS_LOCK = threading.Lock()
 _IDENTITY_CACHE_KEY = "_nm_current_identity"
@@ -90,6 +93,37 @@ _PENDING_LOGIN_SESSION_KEY = "nm_pending_login"
 _PENDING_TOTP_SETUP_SESSION_KEY = "nm_pending_totp_setup"
 _PENDING_PASSKEY_REGISTRATION_SESSION_KEY = "nm_pending_passkey_registration"
 _PENDING_PASSKEY_AUTHENTICATION_SESSION_KEY = "nm_pending_passkey_authentication"
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return max(minimum, default)
+    try:
+        return max(minimum, int(raw))
+    except Exception:
+        return max(minimum, default)
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.1) -> float:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return max(minimum, default)
+    try:
+        return max(minimum, float(raw))
+    except Exception:
+        return max(minimum, default)
+
+
+_API_EXCHANGE_MAX_WORKERS = _env_int("CUSTOMERS_API_EXCHANGE_WORKERS", 16, minimum=4)
+_API_EXCHANGE_WAIT_TIMEOUT_SEC = _env_float("CUSTOMERS_API_EXCHANGE_WAIT_TIMEOUT", 20.0, minimum=1.0)
+_OIDC_HTTP_TIMEOUT_SEC = _env_float("CUSTOMERS_OIDC_HTTP_TIMEOUT", 12.0, minimum=1.0)
+_OIDC_TOKEN_TIMEOUT_SEC = _env_float("CUSTOMERS_OIDC_TOKEN_TIMEOUT", 15.0, minimum=1.0)
+_API_EXCHANGE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_API_EXCHANGE_MAX_WORKERS,
+    thread_name_prefix="customers-api",
+)
+atexit.register(_API_EXCHANGE_EXECUTOR.shutdown, wait=False, cancel_futures=True)
 
 
 def _settings() -> Settings:
@@ -111,6 +145,38 @@ def _nmchain() -> Optional[NmChainClient]:
 def _store_backend_name() -> str:
     store = _store()
     return getattr(store, "store_type", "postgres")
+
+
+def _submit_api_exchange(task: Callable[..., Any], *args: Any, **kwargs: Any) -> concurrent.futures.Future[Any]:
+    return _API_EXCHANGE_EXECUTOR.submit(task, *args, **kwargs)
+
+
+def _wait_api_exchange(future: concurrent.futures.Future[Any], *, timeout: Optional[float] = None) -> Any:
+    return future.result(timeout=timeout if timeout is not None else _API_EXCHANGE_WAIT_TIMEOUT_SEC)
+
+
+def _run_api_exchange(
+    task: Callable[..., Any],
+    *args: Any,
+    result_timeout: Optional[float] = None,
+    **kwargs: Any,
+) -> Any:
+    return _wait_api_exchange(_submit_api_exchange(task, *args, **kwargs), timeout=result_timeout)
+
+
+def _submit_background_api_exchange(
+    description: str,
+    task: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    def _runner() -> None:
+        try:
+            task(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("%s failed: %s", description, exc)
+
+    _submit_api_exchange(_runner)
 
 
 def _extract_bearer_token(auth_header: Optional[str]) -> Optional[str]:
@@ -345,16 +411,56 @@ def _jwk_to_public_key(jwk: Dict[str, Any]):
     return numbers.public_key()
 
 
+def _oidc_http_get(
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float = _OIDC_HTTP_TIMEOUT_SEC,
+) -> requests.Response:
+    return requests.get(url, headers=headers, timeout=timeout)
+
+
+def _oidc_http_post(
+    url: str,
+    *,
+    data: Dict[str, Any],
+    auth: Optional[Tuple[str, str]] = None,
+    timeout: float = _OIDC_TOKEN_TIMEOUT_SEC,
+) -> requests.Response:
+    return requests.post(url, data=data, auth=auth, timeout=timeout)
+
+
+def _oidc_cache_read(cache_key: str, ts_key: str, ttl_seconds: int) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    with _OIDC_CACHE_LOCK:
+        cached = _OIDC_CACHE.get(cache_key)
+        cached_ts = float(_OIDC_CACHE.get(ts_key, 0.0))
+    if isinstance(cached, dict) and (now - cached_ts) < ttl_seconds:
+        return cached
+    return None
+
+
+def _oidc_cache_write(cache_key: str, ts_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    with _OIDC_CACHE_LOCK:
+        _OIDC_CACHE[cache_key] = payload
+        _OIDC_CACHE[ts_key] = time.time()
+    return payload
+
+
 def _oidc_discovery() -> Optional[Dict[str, Any]]:
     settings = _settings()
     if not settings.oidc_enabled or not settings.oidc_issuer:
         return None
-    now = time.time()
-    cached = _OIDC_CACHE.get("config")
-    if cached and (now - float(_OIDC_CACHE.get("ts", 0.0)) < settings.oidc_discovery_ttl):
+    cached = _oidc_cache_read("config", "config_ts", settings.oidc_discovery_ttl)
+    if cached:
         return cached
     url = settings.oidc_issuer.rstrip("/") + "/.well-known/openid-configuration"
-    response = requests.get(url, timeout=12)
+    response = _run_api_exchange(
+        _oidc_http_get,
+        url,
+        timeout=_OIDC_HTTP_TIMEOUT_SEC,
+        result_timeout=_OIDC_TOKEN_TIMEOUT_SEC,
+    )
     response.raise_for_status()
     data = response.json()
     if not isinstance(data, dict):
@@ -362,39 +468,74 @@ def _oidc_discovery() -> Optional[Dict[str, Any]]:
     issuer = str(data.get("issuer") or "").strip()
     if issuer and issuer.rstrip("/") != settings.oidc_issuer.rstrip("/"):
         raise RuntimeError("oidc_issuer_mismatch")
-    _OIDC_CACHE["config"] = data
-    _OIDC_CACHE["ts"] = now
-    return data
+    return _oidc_cache_write("config", "config_ts", data)
 
 
-def _oidc_jwks() -> Optional[Dict[str, Any]]:
-    config = _oidc_discovery()
+def _oidc_prefetch_jwks(config: Optional[Dict[str, Any]]) -> Optional[concurrent.futures.Future[Any]]:
+    settings = _settings()
+    if settings.oidc_skip_jwt_verify:
+        return None
+    if _oidc_cache_read("jwks", "jwks_ts", settings.oidc_discovery_ttl):
+        return None
+    config = config or _oidc_discovery()
+    if not isinstance(config, dict):
+        return None
+    jwks_uri = str(config.get("jwks_uri") or "").strip()
+    if not jwks_uri:
+        return None
+    return _submit_api_exchange(_oidc_http_get, jwks_uri, timeout=_OIDC_HTTP_TIMEOUT_SEC)
+
+
+def _oidc_jwks(
+    *,
+    config: Optional[Dict[str, Any]] = None,
+    prefetched_response: Optional[concurrent.futures.Future[Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    settings = _settings()
+    cached = _oidc_cache_read("jwks", "jwks_ts", settings.oidc_discovery_ttl)
+    if cached:
+        return cached
+    if prefetched_response is not None:
+        try:
+            response = _wait_api_exchange(prefetched_response, timeout=_OIDC_TOKEN_TIMEOUT_SEC)
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, dict):
+                return _oidc_cache_write("jwks", "jwks_ts", data)
+        except Exception:
+            pass
+    config = config or _oidc_discovery()
     if not config:
         return None
-    settings = _settings()
-    cached = _OIDC_CACHE.get("jwks")
-    if cached and (time.time() - float(_OIDC_CACHE.get("ts", 0.0)) < settings.oidc_discovery_ttl):
-        return cached
     jwks_uri = config.get("jwks_uri")
     if not jwks_uri:
         return None
-    response = requests.get(jwks_uri, timeout=12)
+    response = _run_api_exchange(
+        _oidc_http_get,
+        jwks_uri,
+        timeout=_OIDC_HTTP_TIMEOUT_SEC,
+        result_timeout=_OIDC_TOKEN_TIMEOUT_SEC,
+    )
     response.raise_for_status()
     data = response.json()
     if not isinstance(data, dict):
         return None
-    _OIDC_CACHE["jwks"] = data
-    _OIDC_CACHE["ts"] = time.time()
-    return data
+    return _oidc_cache_write("jwks", "jwks_ts", data)
 
 
-def _verify_jwt(token: str, *, nonce: Optional[str]) -> Dict[str, Any]:
+def _verify_jwt(
+    token: str,
+    *,
+    nonce: Optional[str],
+    config: Optional[Dict[str, Any]] = None,
+    jwks_future: Optional[concurrent.futures.Future[Any]] = None,
+) -> Dict[str, Any]:
     settings = _settings()
     header, payload, signature, signing_input = _parse_jwt(token)
     if not settings.oidc_skip_jwt_verify:
         if header.get("alg") != "RS256":
             raise RuntimeError("unsupported_jwt_algorithm")
-        jwks = _oidc_jwks() or {}
+        jwks = _oidc_jwks(config=config, prefetched_response=jwks_future) or {}
         keys = jwks.get("keys") if isinstance(jwks, dict) else None
         if not isinstance(keys, list) or not keys:
             raise RuntimeError("jwks_missing")
@@ -431,27 +572,56 @@ def _verify_jwt(token: str, *, nonce: Optional[str]) -> Dict[str, Any]:
     return payload
 
 
+def _oidc_prefetch_userinfo(
+    access_token: Optional[str],
+    *,
+    claims: Dict[str, Any],
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[concurrent.futures.Future[Any]]:
+    settings = _settings()
+    if not claims or not access_token:
+        return None
+    if not (settings.oidc_use_userinfo or not claims.get(settings.oidc_email_claim)):
+        return None
+    config = config or _oidc_discovery()
+    userinfo_endpoint = config.get("userinfo_endpoint") if isinstance(config, dict) else None
+    if not userinfo_endpoint:
+        return None
+    return _submit_api_exchange(
+        _oidc_http_get,
+        userinfo_endpoint,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=_OIDC_HTTP_TIMEOUT_SEC,
+    )
+
+
 def _oidc_maybe_enrich_claims(
     claims: Dict[str, Any],
     access_token: Optional[str],
     *,
     config: Optional[Dict[str, Any]] = None,
+    userinfo_future: Optional[concurrent.futures.Future[Any]] = None,
 ) -> Dict[str, Any]:
     settings = _settings()
     if not claims or not access_token:
         return claims
     if not (settings.oidc_use_userinfo or not claims.get(settings.oidc_email_claim)):
         return claims
-    config = config or _oidc_discovery()
-    userinfo_endpoint = config.get("userinfo_endpoint") if isinstance(config, dict) else None
-    if not userinfo_endpoint:
-        return claims
     try:
-        response = requests.get(
-            userinfo_endpoint,
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=12,
-        )
+        if userinfo_future is not None:
+            response = _wait_api_exchange(userinfo_future, timeout=_OIDC_TOKEN_TIMEOUT_SEC)
+        else:
+            config = config or _oidc_discovery()
+            userinfo_endpoint = config.get("userinfo_endpoint") if isinstance(config, dict) else None
+            if not userinfo_endpoint:
+                return claims
+            response = _run_api_exchange(
+                _oidc_http_get,
+                userinfo_endpoint,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=_OIDC_HTTP_TIMEOUT_SEC,
+                result_timeout=_OIDC_TOKEN_TIMEOUT_SEC,
+            )
         if response.status_code >= 400:
             return claims
         payload = response.json()
@@ -1514,18 +1684,17 @@ def _record_identity_event(
     for key in ("groups", "active_team", "team_count", "pending_invitation_count"):
         if key not in details and key in payload:
             details[key] = payload.get(key)
-    try:
-        chain.upsert_identity(
-            user,
-            role=role,
-            email=email,
-            provider=provider,
-            subject=subject,
-            request_id=request_id,
-            meta=details,
-        )
-    except Exception as exc:
-        logger.warning("nmchain identity upsert failed for %s: %s", user, exc)
+    _submit_background_api_exchange(
+        f"nmchain identity upsert failed for {user}",
+        chain.upsert_identity,
+        user,
+        role=role,
+        email=email,
+        provider=provider,
+        subject=subject,
+        request_id=request_id,
+        meta=details,
+    )
 
 
 def _record_login_event(
@@ -1542,17 +1711,16 @@ def _record_login_event(
     details = dict(meta or {})
     if provider and "provider" not in details:
         details["provider"] = provider
-    try:
-        chain.observe_login(
-            user,
-            system="customers",
-            auth_mode=auth_mode,
-            session_id=session_id,
-            remote_addr=_client_ip() or None,
-            meta=details,
-        )
-    except Exception as exc:
-        logger.warning("nmchain login event failed for %s: %s", user, exc)
+    _submit_background_api_exchange(
+        f"nmchain login event failed for {user}",
+        chain.observe_login,
+        user,
+        system="customers",
+        auth_mode=auth_mode,
+        session_id=session_id,
+        remote_addr=_client_ip() or None,
+        meta=details,
+    )
 
 
 def _current_request_identity() -> Optional[Dict[str, Any]]:
@@ -2011,6 +2179,7 @@ def create_app() -> Flask:
         token_endpoint = config.get("token_endpoint")
         if not token_endpoint:
             return jsonify({"error": "oidc_token_endpoint_missing"}), 500
+        jwks_future = _oidc_prefetch_jwks(config)
         token_payload = {
             "grant_type": "authorization_code",
             "code": code,
@@ -2026,7 +2195,14 @@ def create_app() -> Flask:
                 token_payload["client_secret"] = settings.oidc_client_secret
             else:
                 auth = (settings.oidc_client_id, settings.oidc_client_secret)
-        token_response = requests.post(token_endpoint, data=token_payload, auth=auth, timeout=15)
+        token_response = _run_api_exchange(
+            _oidc_http_post,
+            token_endpoint,
+            data=token_payload,
+            auth=auth,
+            timeout=_OIDC_TOKEN_TIMEOUT_SEC,
+            result_timeout=_OIDC_TOKEN_TIMEOUT_SEC + 1.0,
+        )
         if token_response.status_code >= 400:
             return redirect(url_for("login"))
         token_data = token_response.json()
@@ -2034,11 +2210,27 @@ def create_app() -> Flask:
         access_token = str(token_data.get("access_token") or "")
         if not id_token:
             return redirect(url_for("login"))
+        raw_claims: Dict[str, Any] = {}
         try:
-            claims = _verify_jwt(id_token, nonce=session.get("oidc_nonce"))
+            _, raw_claims, _, _ = _parse_jwt(id_token)
+        except Exception:
+            raw_claims = {}
+        userinfo_future = _oidc_prefetch_userinfo(access_token, claims=raw_claims, config=config)
+        try:
+            claims = _verify_jwt(
+                id_token,
+                nonce=session.get("oidc_nonce"),
+                config=config,
+                jwks_future=jwks_future,
+            )
         except Exception:
             return redirect(url_for("login"))
-        claims = _oidc_maybe_enrich_claims(claims, access_token, config=config)
+        claims = _oidc_maybe_enrich_claims(
+            claims,
+            access_token,
+            config=config,
+            userinfo_future=userinfo_future,
+        )
         username = _oidc_username_from_claims(claims)
         if not username:
             return redirect(url_for("login"))
@@ -2191,10 +2383,11 @@ def create_app() -> Flask:
         access_token = str(payload.get("access_token") or "").strip()
         if redirect_uri and not _oidc_is_redirect_allowed(redirect_uri):
             return jsonify({"error": "redirect_uri_not_allowed"}), 400
+        config = _oidc_discovery() or {}
+        jwks_future = _oidc_prefetch_jwks(config)
         if code:
             if client_id and client_id != settings.oidc_client_id:
                 return jsonify({"error": "client_id_mismatch"}), 400
-            config = _oidc_discovery() or {}
             token_endpoint = config.get("token_endpoint")
             if not token_endpoint:
                 return jsonify({"error": "oidc_token_endpoint_missing"}), 500
@@ -2212,7 +2405,14 @@ def create_app() -> Flask:
                     token_payload["client_secret"] = settings.oidc_client_secret
                 else:
                     auth = (settings.oidc_client_id, settings.oidc_client_secret)
-            token_response = requests.post(token_endpoint, data=token_payload, auth=auth, timeout=15)
+            token_response = _run_api_exchange(
+                _oidc_http_post,
+                token_endpoint,
+                data=token_payload,
+                auth=auth,
+                timeout=_OIDC_TOKEN_TIMEOUT_SEC,
+                result_timeout=_OIDC_TOKEN_TIMEOUT_SEC + 1.0,
+            )
             if token_response.status_code >= 400:
                 return jsonify({"error": "token_exchange_failed"}), 401
             token_data = token_response.json()
@@ -2220,11 +2420,22 @@ def create_app() -> Flask:
             access_token = str(token_data.get("access_token") or "").strip()
         if not id_token:
             return jsonify({"error": "id_token_required"}), 400
+        raw_claims: Dict[str, Any] = {}
         try:
-            claims = _verify_jwt(id_token, nonce=None)
+            _, raw_claims, _, _ = _parse_jwt(id_token)
+        except Exception:
+            raw_claims = {}
+        userinfo_future = _oidc_prefetch_userinfo(access_token, claims=raw_claims, config=config)
+        try:
+            claims = _verify_jwt(id_token, nonce=None, config=config, jwks_future=jwks_future)
         except Exception:
             return jsonify({"error": "invalid_id_token"}), 401
-        claims = _oidc_maybe_enrich_claims(claims, access_token, config=_oidc_discovery())
+        claims = _oidc_maybe_enrich_claims(
+            claims,
+            access_token,
+            config=config,
+            userinfo_future=userinfo_future,
+        )
         username = _oidc_username_from_claims(claims)
         if not username:
             return jsonify({"error": "username_missing"}), 400
