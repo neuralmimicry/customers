@@ -1,5 +1,13 @@
 # Customers
 
+## Sponsor NeuralMimicry
+
+This service is NeuralMimicry's open-source identity platform — registration, authentication, 2FA, passkeys, SSO, OIDC, and delegated group management, all deployable independently of the wider stack. NeuralMimicry is an independent open-source initiative and we rely on community support to sustain this work.
+
+**[☕ Support us on Crowdfunder](https://www.crowdfunder.co.uk/p/qr/aWggxwPW?utm_campaign=sharemodal&utm_medium=referral&utm_source=shortlink)**
+
+---
+
 Customers is NeuralMimicry's dedicated identity service.
 It owns user registration, login, logout, browser sessions, optional authenticator-app 2FA, passkey sign-in, SSO/OIDC exchange, profile management, and voice-token lifecycle.
 
