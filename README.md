@@ -22,11 +22,11 @@ The original Refiner codebase had four operational concerns mixed together:
 
 That split is now explicit:
 
-- Refiner stays in `/home/pbisaacs/Developer/neuralmimicry/rag_demo`
-- Customers lives in `/home/pbisaacs/Developer/neuralmimicry/customers`
-- Billing lives in `/home/pbisaacs/Developer/neuralmimicry/billing`
-- nmstt lives in `/home/pbisaacs/Developer/neuralmimicry/nmstt`
-- nmchain in `/home/pbisaacs/Developer/neuralmimicry/nmchain` remains the audit ledger of record
+- Refiner stays in `${NM_LOCAL_REPO_ROOT}/rag_demo`
+- Customers lives in `${NM_LOCAL_REPO_ROOT}/customers`
+- Billing lives in `${NM_LOCAL_REPO_ROOT}/billing`
+- nmstt lives in `${NM_LOCAL_REPO_ROOT}/nmstt`
+- nmchain in `${NM_LOCAL_REPO_ROOT}/nmchain` remains the audit ledger of record
 
 The public API host remains `https://api.neuralmimicry.ai`.
 Refiner proxies auth routes there so the frontend commercial site at `https://neuralmimicry.ai` does not need a second backend host.
@@ -365,7 +365,7 @@ podman build -t ghcr.io/neuralmimicry/customers:latest -f Containerfile .
 
 Tenant playbook:
 
-- `/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible/continuum_tenant_customers_site.yml`
+- `${SWARMHPC_ROOT}/swarmhpc/ansible/continuum_tenant_customers_site.yml`
 
 Role:
 
@@ -391,4 +391,4 @@ For the split platform to be fully functional:
 
 See also:
 
-- `/home/pbisaacs/Developer/neuralmimicry/rag_demo/SERVICE_SPLIT_ARCHITECTURE.md`
+- `${NM_LOCAL_REPO_ROOT}/rag_demo/SERVICE_SPLIT_ARCHITECTURE.md`
