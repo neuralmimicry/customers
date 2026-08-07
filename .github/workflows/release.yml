@@ -160,6 +160,12 @@ jobs:
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # The production Continuum nodes include arm64 hosts (qc01 and Spirit).
+      # Publish both architectures so a release cannot leave those nodes with
+      # an image that only schedules on amd64.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -178,6 +184,7 @@ jobs:
           context: .
           file: ./Containerfile
           push: true
+          platforms: linux/amd64,linux/arm64
           build-args: |
             CUSTOMERS_VERSION=${{ steps.version.outputs.version }}
           tags: |
