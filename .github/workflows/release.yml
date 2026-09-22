@@ -187,10 +187,47 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: |
             CUSTOMERS_VERSION=${{ steps.version.outputs.version }}
+            TARGET_PAGE_SIZE=4k
           tags: |
             ${{ steps.image.outputs.name }}:${{ steps.version.outputs.version }}
             ${{ steps.image.outputs.name }}:${{ steps.version.outputs.tag }}
             ${{ steps.image.outputs.name }}:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push ARM64 64K HWE image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          push: true
+          platforms: linux/arm64
+          build-args: |
+            CUSTOMERS_VERSION=${{ steps.version.outputs.version }}
+            TARGET_PAGE_SIZE=64k-hwe
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ steps.version.outputs.version }}-arm64-64k-hwe
+            ${{ steps.image.outputs.name }}:${{ steps.version.outputs.tag }}-arm64-64k-hwe
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Publish explicit ARM64 4K image variant
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          push: true
+          platforms: linux/arm64
+          build-args: |
+            CUSTOMERS_VERSION=${{ steps.version.outputs.version }}
+            TARGET_PAGE_SIZE=4k
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ steps.version.outputs.version }}-arm64-4k
+            ${{ steps.image.outputs.name }}:${{ steps.version.outputs.tag }}-arm64-4k
           labels: |
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}

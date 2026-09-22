@@ -1140,6 +1140,17 @@ def _can_view_team(user: Optional[str], team_id: Optional[str]) -> bool:
     return any(str(item.get("team_id") or "").strip() == cleaned_team for item in outgoing)
 
 
+def _account_policy(user: str) -> Dict[str, Any]:
+    # Do not silently ignore policy-store failures on authentication paths.
+    metadata = _store().users.get_metadata(user) or {}
+    return dict(metadata.get("account_policy") or {})
+
+
+def _record_sensitive_change(user: str, kind: str, *, requires_password_change=None) -> None:
+    from .account_policy import sensitive_change_metadata
+    _store().users.mutate_metadata(user, lambda metadata: sensitive_change_metadata(metadata, kind, requires_password_change=requires_password_change))
+
+
 def _user_metadata(user: Optional[str]) -> Dict[str, Any]:
     cleaned = str(user or "").strip()
     if not cleaned:
@@ -1162,13 +1173,13 @@ def _update_user_settings(user: str, raw_settings: Any) -> Dict[str, Any]:
     cleaned = str(user or "").strip()
     if not cleaned:
         raise SettingsValidationError(["user is required"])
-    current_metadata = _user_metadata(cleaned)
-    current_settings = settings_from_metadata(current_metadata)
-    merged = validate_settings_patch(raw_settings, current=current_settings)
-    updated_metadata = metadata_with_settings(current_metadata, merged, updated_at=_now_iso())
-    if not _store().users.set_metadata(cleaned, updated_metadata):
-        raise KeyError(cleaned)
-    return merged
+    def transform(metadata):
+        from .account_policy import sensitive_change_metadata
+        current_settings = settings_from_metadata(metadata)
+        merged = validate_settings_patch(raw_settings, current=current_settings)
+        updated = metadata_with_settings(metadata, merged, updated_at=_now_iso())
+        return sensitive_change_metadata(updated, "customer_details") if merged != current_settings else updated
+    return settings_from_metadata(_store().users.mutate_metadata(cleaned, transform))
 
 
 def _user_has_local_password(user: Optional[str]) -> bool:
@@ -1189,14 +1200,7 @@ def _update_user_security_state(user: str, security_state: Dict[str, Any]) -> Di
     cleaned = str(user or "").strip()
     if not cleaned:
         raise KeyError("user")
-    current_metadata = _user_metadata(cleaned)
-    updated_metadata = metadata_with_security_state(
-        current_metadata,
-        security_state,
-        secret_key=_settings().secret_key,
-    )
-    if not _store().users.set_metadata(cleaned, updated_metadata):
-        raise KeyError(cleaned)
+    _store().users.mutate_metadata(cleaned, lambda metadata: metadata_with_security_state(metadata, security_state, secret_key=_settings().secret_key))
     return security_state
 
 
@@ -1348,6 +1352,9 @@ def _validate_account_creation_payload(
         )
     if confirm and confirm != password:
         return None, (jsonify({"error": "password_mismatch", "details": "Passwords do not match."}), 400)
+    from .account_policy import valid_password, password_message
+    if not valid_password(password, _settings().password_min_length):
+        return None, (jsonify({"error": "password_too_weak", "details": password_message(_settings().password_min_length)}), 400)
     return {
         "username": username,
         "password": password,
@@ -1365,6 +1372,9 @@ def _attempt_local_login(username: str, password: str, *, source: str) -> Tuple[
     if not _store().users.verify(cleaned_username, cleaned_password):
         _record_login_attempt(cleaned_username, ok=False)
         return "error", {"error": "invalid_credentials"}, 401
+    from .account_policy import valid_password
+    if not valid_password(cleaned_password, _settings().password_min_length):
+        _record_sensitive_change(cleaned_username, "legacy_password", requires_password_change=True)
     _record_login_attempt(cleaned_username, ok=True)
     if _totp_enabled_for_user(cleaned_username):
         session.pop("user", None)
@@ -1396,6 +1406,8 @@ def _complete_totp_login(code: Any, *, source: str) -> Tuple[str, Dict[str, Any]
     if not username:
         _clear_auth_challenges(_PENDING_LOGIN_SESSION_KEY)
         return "error", {"error": "mfa_challenge_missing"}, 400
+    if _login_throttled(username):
+        return "error", {"error": "too_many_attempts"}, 429
     security_state = _user_security_state(username)
     totp_state = security_state.get("totp", {})
     secret = str(totp_state.get("secret") or "").strip()
@@ -1403,6 +1415,7 @@ def _complete_totp_login(code: Any, *, source: str) -> Tuple[str, Dict[str, Any]
         _clear_auth_challenges(_PENDING_LOGIN_SESSION_KEY)
         return "error", {"error": "totp_not_enabled"}, 409
     if not verify_totp_code(secret, code):
+        _record_login_attempt(username, ok=False)
         return "error", {"error": "invalid_mfa_code"}, 401
     _clear_auth_challenges(_PENDING_LOGIN_SESSION_KEY)
     _finalize_login(username, auth_mode="local_mfa", provider="local", source=source)
@@ -1583,6 +1596,13 @@ def _user_identity_payload(user: str, *, include_directory: bool = False) -> Dic
         team_records = _visible_team_records_for_user(cleaned)
         payload["team_tree"] = _build_team_tree(team_records, active_teams + incoming_invitations)
         payload["group_directory"] = _visible_group_records_for_user(cleaned)
+    policy = _account_policy(cleaned)
+    payload["requires_password_change"] = bool(policy.get("requires_password_change"))
+    payload["refund_hold_until"] = policy.get("refund_hold_until")
+    payload["sensitive_details_changed_at"] = policy.get("sensitive_details_changed_at")
+    if payload["requires_password_change"]:
+        payload["service_access"] = {key: {"service_key": key, "access_level": "none", "can_use": False, "can_control": False, "visible": False} for key in set(service_access) | {"billing", "refiner", "customers", "aarnn", "continuum", "tracey"}}
+        payload["visible_services"] = []
     return payload
 
 
@@ -1660,6 +1680,9 @@ def _validate_password_change_payload(payload: Dict[str, Any], *, require_curren
         )
     if confirm_password and confirm_password != new_password:
         return None, (jsonify({"error": "password_mismatch", "details": "Passwords do not match."}), 400)
+    from .account_policy import valid_password, password_message
+    if not valid_password(new_password, _settings().password_min_length):
+        return None, (jsonify({"error": "password_too_weak", "details": password_message(_settings().password_min_length)}), 400)
     return {
         "current_password": current_password,
         "new_password": new_password,
@@ -1764,6 +1787,49 @@ def _current_user() -> Optional[str]:
     return user or None
 
 
+def _current_session_user() -> Optional[str]:
+    """Return the browser-authenticated user for profile management routes.
+
+    A bearer token can authenticate product requests, but it must not be able
+    to mint or manage more bearer tokens. The account page uses the session
+    cookie, so keeping this boundary explicit protects the token-management
+    API if a client credential is ever exposed.
+    """
+    user = str(session.get("user") or "").strip()
+    return user or None
+
+
+def _orchestrator_token_ttl(payload: Dict[str, Any]) -> Optional[int]:
+    raw_days = payload.get("expires_in_days")
+    if raw_days in (None, ""):
+        return None
+    try:
+        days = int(raw_days)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid_token_expiry") from exc
+    if days < 0 or days > 3650:
+        raise ValueError("invalid_token_expiry")
+    return days * 86400 if days else None
+
+
+def _orchestrator_token_payload(entry: Dict[str, Any]) -> Dict[str, Any]:
+    expires_at = str(entry.get("expires_at") or "").strip()
+    status = "revoked" if bool(entry.get("disabled")) else (
+        "expired" if expires_at and expires_at <= _now_iso() else "active"
+    )
+    return {
+        "id": entry.get("id"),
+        "label": entry.get("label") or "AARNN Rust UI",
+        "token_hint": entry.get("token_hint"),
+        "created_at": entry.get("created_at"),
+        "last_used_at": entry.get("last_used_at"),
+        "expires_at": entry.get("expires_at"),
+        "status": status,
+        "disabled": bool(entry.get("disabled")),
+        "permissions": "Uses the AARNN and other services currently granted to your account.",
+    }
+
+
 def _issue_access_token_payload(user: str, *, source: str) -> Dict[str, Any]:
     try:
         issued = _store().access_tokens.issue(user, label=source, meta={"source": source})
@@ -1807,6 +1873,8 @@ def _issue_service_account_access_token(
 
 
 def _login_payload(user: str, *, source: str) -> Dict[str, Any]:
+    if _account_policy(user).get("requires_password_change"):
+        return {"status": "password_change_required", "next_url": f"{_settings().site_base.rstrip('/')}/account", **_user_identity_payload(user)}
     payload = {
         "status": "ok",
         "sso_token": _issue_sso_token(user),
@@ -1948,6 +2016,16 @@ def create_app() -> Flask:
             return jsonify({"error": "https_required"}), 403
         if request.method == "OPTIONS":
             return make_response("", 204)
+        if request.method in {"POST", "PATCH", "DELETE"} and request.path.startswith("/api/") and not request.path.startswith("/api/internal/"):
+            origin = request.headers.get("Origin", "").rstrip("/")
+            if origin and origin not in {value.rstrip("/") for value in settings.cors_origins}:
+                return jsonify({"error": "forbidden_origin"}), 403
+        if not request.path.startswith(("/api/internal/", "/static/")):
+            user = _current_user()
+            allowed = {"/api/profile", "/api/profile/password", "/api/session", "/api/logout", "/api/auth/config", "/api/login", "/api/login/mfa/totp", "/login", "/logout"}
+            if user and _account_policy(user).get("requires_password_change"):
+                if request.path not in allowed or (request.path == "/api/profile" and request.method != "GET"):
+                    return jsonify({"error": "password_change_required", "details": "Change your temporary password before continuing."}), 403
         return None
 
     @app.after_request
@@ -2054,7 +2132,7 @@ def create_app() -> Flask:
             if totp_code or mfa_required:
                 outcome, payload, _status = _complete_totp_login(totp_code, source="login_form_mfa")
                 if outcome == "success":
-                    return redirect(next_path)
+                    return redirect(payload.get("next_url") if payload.get("requires_password_change") else next_path)
                 error = _auth_error_message(payload, "Sign-in failed.")
                 mfa_required = True
             else:
@@ -2062,7 +2140,7 @@ def create_app() -> Flask:
                 password = str(request.form.get("password") or "")
                 outcome, payload, _status = _attempt_local_login(username, password, source="login_form")
                 if outcome == "success":
-                    return redirect(next_path)
+                    return redirect(payload.get("next_url") if payload.get("requires_password_change") else next_path)
                 if outcome == "mfa_required":
                     error = None
                     mfa_required = True
@@ -2544,6 +2622,8 @@ def create_app() -> Flask:
             except KeyError:
                 return jsonify({"error": "user_not_found"}), 404
         if "email" in payload:
+            if (email or None) != _email_for_user(user):
+                _record_sensitive_change(user, "customer_details")
             store.users.set_email(user, email or None)
         _record_identity_event(
             user,
@@ -2553,6 +2633,142 @@ def create_app() -> Flask:
             meta={"source": "api_profile", "settings_updated": "settings" in payload},
         )
         return jsonify({"status": "ok", **_user_identity_payload(user, include_directory=True)})
+
+    @app.route("/api/profile/orchestrator-tokens", methods=["GET", "POST"])
+    def api_profile_orchestrator_tokens() -> Response:
+        user = _current_session_user()
+        if not user:
+            return jsonify({"error": "unauthorized"}), 401
+        if _account_policy(user).get("requires_password_change"):
+            return jsonify({"error": "password_change_required"}), 403
+        if request.method == "GET":
+            identity = _user_identity_payload(user)
+            return jsonify(
+                {
+                    "tokens": [
+                        _orchestrator_token_payload(item)
+                        for item in _store().access_tokens.list_orchestrator_tokens(user)
+                    ],
+                    "service_access": identity.get("service_access", {}),
+                }
+            )
+        payload = request.get_json(force=True, silent=True) or {}
+        label = str(payload.get("label") or "AARNN Rust UI").strip()
+        if not label or len(label) > 100:
+            return jsonify({"error": "invalid_token_label", "details": "Token name must be 1-100 characters."}), 400
+        try:
+            ttl_seconds = _orchestrator_token_ttl(payload)
+            issued = _store().access_tokens.issue_orchestrator(
+                user,
+                label=label,
+                ttl_seconds=ttl_seconds,
+            )
+        except ValueError as exc:
+            if str(exc) == "invalid_token_expiry":
+                return jsonify({"error": "invalid_token_expiry", "details": "Expiry must be between 0 and 3650 days."}), 400
+            raise
+        _record_identity_event(
+            user,
+            role=_role_for_user(user),
+            email=_email_for_user(user),
+            provider="profile",
+            meta={"source": "api_profile_orchestrator_token_create", "token_id": issued.get("id")},
+        )
+        return jsonify(
+            {
+                "status": "ok",
+                "token": issued.get("token"),
+                "token_record": _orchestrator_token_payload(issued),
+                "warning": "Copy this token now. It cannot be displayed again after this response.",
+            }
+        ), 201
+
+    @app.route("/api/profile/orchestrator-tokens/<token_id>", methods=["PATCH", "DELETE"])
+    def api_profile_orchestrator_token(token_id: str) -> Response:
+        user = _current_session_user()
+        if not user:
+            return jsonify({"error": "unauthorized"}), 401
+        if _account_policy(user).get("requires_password_change"):
+            return jsonify({"error": "password_change_required"}), 403
+        if request.method == "DELETE":
+            if not _store().access_tokens.revoke_orchestrator(token_id, user):
+                return jsonify({"error": "token_not_found"}), 404
+            _record_identity_event(
+                user,
+                role=_role_for_user(user),
+                email=_email_for_user(user),
+                provider="profile",
+                meta={"source": "api_profile_orchestrator_token_revoke", "token_id": token_id},
+            )
+            return jsonify({"status": "revoked", "id": token_id})
+        payload = request.get_json(force=True, silent=True) or {}
+        label = str(payload.get("label") or "").strip()
+        if not label or len(label) > 100:
+            return jsonify({"error": "invalid_token_label", "details": "Token name must be 1-100 characters."}), 400
+        try:
+            ttl_seconds = _orchestrator_token_ttl(payload)
+            updated = _store().access_tokens.update_orchestrator(
+                token_id,
+                user,
+                label=label,
+                ttl_seconds=ttl_seconds,
+            )
+        except ValueError as exc:
+            if str(exc) == "invalid_token_expiry":
+                return jsonify({"error": "invalid_token_expiry", "details": "Expiry must be between 0 and 3650 days."}), 400
+            raise
+        if not updated:
+            return jsonify({"error": "token_not_found"}), 404
+        _record_identity_event(
+            user,
+            role=_role_for_user(user),
+            email=_email_for_user(user),
+            provider="profile",
+            meta={"source": "api_profile_orchestrator_token_update", "token_id": token_id},
+        )
+        return jsonify({"status": "ok", "token_record": _orchestrator_token_payload(updated)})
+
+    @app.route("/api/profile/orchestrator-tokens/<token_id>/rotate", methods=["POST"])
+    def api_profile_orchestrator_token_rotate(token_id: str) -> Response:
+        user = _current_session_user()
+        if not user:
+            return jsonify({"error": "unauthorized"}), 401
+        if _account_policy(user).get("requires_password_change"):
+            return jsonify({"error": "password_change_required"}), 403
+        existing = next(
+            (item for item in _store().access_tokens.list_orchestrator_tokens(user) if item.get("id") == token_id),
+            None,
+        )
+        if not existing:
+            return jsonify({"error": "token_not_found"}), 404
+        if existing.get("disabled"):
+            return jsonify({"error": "token_revoked"}), 409
+        payload = request.get_json(force=True, silent=True) or {}
+        label = str(payload.get("label") or existing.get("label") or "AARNN Rust UI").strip()
+        if not label or len(label) > 100:
+            return jsonify({"error": "invalid_token_label", "details": "Token name must be 1-100 characters."}), 400
+        try:
+            ttl_seconds = _orchestrator_token_ttl(payload)
+        except ValueError:
+            return jsonify({"error": "invalid_token_expiry", "details": "Expiry must be between 0 and 3650 days."}), 400
+        if not _store().access_tokens.revoke_orchestrator(token_id, user):
+            return jsonify({"error": "token_not_found"}), 404
+        issued = _store().access_tokens.issue_orchestrator(user, label=label, ttl_seconds=ttl_seconds)
+        _record_identity_event(
+            user,
+            role=_role_for_user(user),
+            email=_email_for_user(user),
+            provider="profile",
+            meta={"source": "api_profile_orchestrator_token_rotate", "token_id": token_id, "new_token_id": issued.get("id")},
+        )
+        return jsonify(
+            {
+                "status": "ok",
+                "token": issued.get("token"),
+                "token_record": _orchestrator_token_payload(issued),
+                "warning": "The previous token has been revoked. Copy this token now; it cannot be displayed again.",
+            }
+        ), 201
 
     @app.route("/api/profile/password", methods=["POST"])
     def api_profile_password() -> Response:
@@ -2570,8 +2786,11 @@ def create_app() -> Flask:
         new_password = str((validated or {}).get("new_password") or "")
         if not _store().users.verify(user, current_password):
             return jsonify({"error": "invalid_current_password"}), 403
+        if new_password == current_password:
+            return jsonify({"error": "password_unchanged", "details": "Choose a password different from your current password."}), 400
         if not _store().users.set_password(user, new_password):
             return jsonify({"error": "user_not_found"}), 404
+        _record_sensitive_change(user, "password", requires_password_change=False)
         _record_identity_event(
             user,
             role=_role_for_user(user),
@@ -2579,7 +2798,7 @@ def create_app() -> Flask:
             provider="profile",
             meta={"source": "api_profile_password", "password_changed": True},
         )
-        return jsonify({"status": "ok"})
+        return jsonify(_login_payload(user, source="password_change"))
 
     @app.route("/api/profile/mfa/totp/start", methods=["POST"])
     def api_profile_mfa_totp_start() -> Response:
@@ -2587,6 +2806,8 @@ def create_app() -> Flask:
         auth_error = _validate_local_auth_security(user)
         if auth_error is not None:
             return auth_error
+        if _totp_enabled_for_user(user):
+            return jsonify({"error": "totp_already_enabled"}), 409
         secret = generate_totp_secret()
         enrolment = build_totp_enrolment(
             secret,
@@ -2632,6 +2853,7 @@ def create_app() -> Flask:
         }
         _update_user_security_state(str(user or ""), security_state)
         _clear_auth_challenges(_PENDING_TOTP_SETUP_SESSION_KEY)
+        _record_sensitive_change(str(user), "authenticator")
         _record_identity_event(
             str(user or ""),
             role=_role_for_user(str(user or "")),
@@ -2653,6 +2875,12 @@ def create_app() -> Flask:
         if auth_error is not None:
             return auth_error
         security_state = _user_security_state(user)
+        payload = request.get_json(force=True, silent=True) or {}
+        if _login_throttled(str(user or "")):
+            return jsonify({"error": "too_many_attempts"}), 429
+        if not verify_totp_code(str(security_state.get("totp", {}).get("secret") or ""), payload.get("code")):
+            _record_login_attempt(str(user or ""), ok=False)
+            return jsonify({"error": "invalid_mfa_code"}), 401
         security_state["totp"] = {
             "enabled": False,
             "secret": None,
@@ -2660,6 +2888,7 @@ def create_app() -> Flask:
             "last_verified_at": _now_iso(),
         }
         _update_user_security_state(str(user or ""), security_state)
+        _record_sensitive_change(str(user), "authenticator")
         _clear_auth_challenges(_PENDING_TOTP_SETUP_SESSION_KEY)
         _record_identity_event(
             str(user or ""),
@@ -2753,6 +2982,7 @@ def create_app() -> Flask:
             provider="profile",
             meta={"source": "api_profile_passkeys_register_verify", "passkey_registered": True},
         )
+        _record_sensitive_change(str(user), "passkey")
         return (
             jsonify(
                 {
@@ -2787,6 +3017,7 @@ def create_app() -> Flask:
             provider="profile",
             meta={"source": "api_profile_passkey_delete", "passkey_removed": True},
         )
+        _record_sensitive_change(str(user), "passkey")
         return jsonify(
             {
                 "status": "ok",
@@ -2923,18 +3154,25 @@ def create_app() -> Flask:
             )
         if confirm and confirm != password:
             return jsonify({"error": "password_mismatch", "details": "Passwords do not match."}), 400
+        from .account_policy import valid_password, password_message
+        if password and not valid_password(password, settings.password_min_length):
+            return jsonify({"error": "password_too_weak", "details": password_message(settings.password_min_length)}), 400
         existing = _store().users.get_user(username)
         status_code = 200
         if existing:
             _store().users.ensure_user(username, role=role, email=existing.get("email"))
             if email_present:
+                if (email or None) != existing.get("email"):
+                    _record_sensitive_change(username, "customer_details")
                 _store().users.set_email(username, email or None)
             if password:
+                _record_sensitive_change(username, "temporary_password", requires_password_change=True)
                 _store().users.set_password(username, password)
         else:
             if not password:
                 return jsonify({"error": "password_required"}), 400
             _store().users.create_user(username, password, role=role, email=email or None)
+            _record_sensitive_change(username, "temporary_password", requires_password_change=True)
             status_code = 201
         user_entry = _store().users.get_user(username) or {"username": username, "role": role, "email": email or None}
         _record_identity_event(
@@ -2966,6 +3204,7 @@ def create_app() -> Flask:
         if error_response is not None:
             return error_response
         new_password = str((validated or {}).get("new_password") or "")
+        _record_sensitive_change(target, "temporary_password", requires_password_change=True)
         if not _store().users.set_password(target, new_password):
             return jsonify({"error": "user_not_found"}), 404
         _record_identity_event(
@@ -3707,6 +3946,27 @@ def create_app() -> Flask:
         if not user_entry:
             return jsonify({"error": "user_not_found"}), 404
         return jsonify({"authenticated": True, "user_record": _user_record_payload(user_entry, include_access=True), **_user_identity_payload(cleaned)})
+
+    @app.route("/api/internal/users/<username>/payment-details-changed", methods=["POST"])
+    @require_app_token
+    def api_payment_details_changed(username: str) -> Response:
+        if not _store().users.get_user(username):
+            return jsonify({"error": "user_not_found"}), 404
+        from .account_policy import sensitive_change_metadata
+        payload = request.get_json(silent=True) or {}
+        event_id = str(payload.get("event_id") or "").strip()
+        if len(event_id) > 128:
+            return jsonify({"error": "invalid_event_id"}), 400
+        def transform(metadata):
+            events = list((metadata.get("account_policy") or {}).get("payment_change_events") or [])
+            if event_id and event_id in events:
+                return metadata
+            updated = sensitive_change_metadata(metadata, "payment_details")
+            if event_id:
+                updated["account_policy"]["payment_change_events"] = (events + [event_id])[-100:]
+            return updated
+        _store().users.mutate_metadata(username, transform)
+        return jsonify({"status": "ok", **_account_policy(username)})
 
     @app.route("/api/internal/credentials/verify", methods=["POST"])
     @require_app_token

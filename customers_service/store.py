@@ -727,6 +727,8 @@ class PostgresUserStore:
         if self.has_users():
             return
         self.create_user(admin_user, admin_pass, role="admin", email=admin_email)
+        from .account_policy import sensitive_change_metadata
+        self.set_metadata(admin_user, sensitive_change_metadata(self.get_metadata(admin_user) or {}, "temporary_password", requires_password_change=True))
 
     def create_user(self, username: str, password: str, role: str = "user", email: Optional[str] = None) -> None:
         username = str(username or "").strip()
@@ -892,6 +894,16 @@ class PostgresUserStore:
             ).fetchone()
         metadata = (row or {}).get("metadata")
         return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def mutate_metadata(self, username: str, transform) -> Dict[str, Any]:
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                row = conn.execute("SELECT metadata FROM nm_users WHERE username = %s FOR UPDATE", (username,)).fetchone()
+                if not row:
+                    raise KeyError(username)
+                updated = transform(dict(row.get("metadata") or {}))
+                conn.execute("UPDATE nm_users SET metadata = %s, updated_at = NOW() WHERE username = %s", (_jsonb(updated), username))
+                return updated
 
     def set_metadata(self, username: str, metadata: Optional[Dict[str, Any]]) -> bool:
         username = str(username or "").strip()
@@ -2406,6 +2418,7 @@ class PostgresAccessTokenStore:
             "token": raw_token,
             "id": (row or {}).get("id") or token_id,
             "user": (row or {}).get("username") or username,
+            "token_hint": _token_hint(raw_token),
             "label": (row or {}).get("label") or label,
             "created_at": _timestamp((row or {}).get("created_at")) or _timestamp(dt.datetime.now(UTC)),
             "expires_at": _timestamp((row or {}).get("expires_at")) or _timestamp(expires_at),
@@ -2450,6 +2463,24 @@ class PostgresAccessTokenStore:
             token=token,
         )
 
+    def issue_orchestrator(
+        self,
+        username: str,
+        *,
+        label: Optional[str] = None,
+        ttl_seconds: Optional[int] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Issue a durable bearer token intended for a user's AARNN clients."""
+        return self._issue(
+            username,
+            kind="orchestrator",
+            label=label,
+            ttl_seconds=ttl_seconds,
+            meta={"purpose": "aarnn_orchestrator", **dict(meta or {})},
+            one_time=False,
+        )
+
     def verify(self, token: str) -> Optional[Dict[str, Any]]:
         cleaned = str(token or "").strip()
         if not cleaned:
@@ -2463,7 +2494,7 @@ class PostgresAccessTokenStore:
                     SET last_used_at = NOW()
                     FROM nm_users AS u
                     WHERE t.token_hash = %s
-                      AND t.kind = 'access'
+                      AND t.kind IN ('access', 'orchestrator')
                       AND NOT t.disabled
                       AND NOT t.one_time
                       AND (t.expires_at IS NULL OR t.expires_at > NOW())
@@ -2512,6 +2543,95 @@ class PostgresAccessTokenStore:
             }
             for row in rows or []
         ]
+
+    def list_orchestrator_tokens(self, user: str) -> List[Dict[str, Any]]:
+        cleaned_user = str(user or "").strip()
+        if not cleaned_user:
+            return []
+        with self.store.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, username, token_hint, label, created_at, expires_at,
+                       last_used_at, disabled, meta
+                FROM nm_auth_tokens
+                WHERE kind = 'orchestrator' AND username = %s
+                ORDER BY created_at DESC
+                """,
+                (cleaned_user,),
+            ).fetchall()
+        return [
+            {
+                "id": row.get("id"),
+                "user": row.get("username"),
+                "token_hint": row.get("token_hint"),
+                "label": row.get("label"),
+                "created_at": _timestamp(row.get("created_at")),
+                "expires_at": _timestamp(row.get("expires_at")),
+                "last_used_at": _timestamp(row.get("last_used_at")),
+                "disabled": bool(row.get("disabled")),
+                "meta": row.get("meta") if isinstance(row.get("meta"), dict) else {},
+            }
+            for row in rows or []
+        ]
+
+    def update_orchestrator(
+        self,
+        token_id: str,
+        username: str,
+        *,
+        label: str,
+        ttl_seconds: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        cleaned_id = str(token_id or "").strip()
+        cleaned_user = str(username or "").strip()
+        if not cleaned_id or not cleaned_user:
+            return None
+        expires_at = None
+        if ttl_seconds not in (None, ""):
+            expires_at = dt.datetime.now(UTC) + dt.timedelta(seconds=max(30, int(ttl_seconds)))
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    UPDATE nm_auth_tokens
+                    SET label = %s, expires_at = %s
+                    WHERE id = %s AND username = %s AND kind = 'orchestrator'
+                    RETURNING id, username, token_hint, label, created_at, expires_at,
+                              last_used_at, disabled, meta
+                    """,
+                    (label, expires_at, cleaned_id, cleaned_user),
+                ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row.get("id"),
+            "user": row.get("username"),
+            "token_hint": row.get("token_hint"),
+            "label": row.get("label"),
+            "created_at": _timestamp(row.get("created_at")),
+            "expires_at": _timestamp(row.get("expires_at")),
+            "last_used_at": _timestamp(row.get("last_used_at")),
+            "disabled": bool(row.get("disabled")),
+            "meta": row.get("meta") if isinstance(row.get("meta"), dict) else {},
+        }
+
+    def revoke_orchestrator(self, token_id: str, username: str) -> bool:
+        cleaned_id = str(token_id or "").strip()
+        cleaned_user = str(username or "").strip()
+        if not cleaned_id or not cleaned_user:
+            return False
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    UPDATE nm_auth_tokens
+                    SET disabled = TRUE
+                    WHERE id = %s AND username = %s AND kind = 'orchestrator'
+                    RETURNING id
+                    """,
+                    (cleaned_id, cleaned_user),
+                ).fetchone()
+        return bool(row)
 
     def revoke(self, token_id: str) -> bool:
         cleaned = str(token_id or "").strip()
@@ -3074,6 +3194,8 @@ class FileUserStore:
         if not admin_user or not admin_pass or self.has_users():
             return
         self.create_user(admin_user, admin_pass, role="admin", email=admin_email)
+        from .account_policy import sensitive_change_metadata
+        self.set_metadata(admin_user, sensitive_change_metadata(self.get_metadata(admin_user) or {}, "temporary_password", requires_password_change=True))
 
     def create_user(self, username: str, password: str, role: str = "user", email: Optional[str] = None) -> None:
         username = str(username or "").strip()
@@ -3171,6 +3293,17 @@ class FileUserStore:
             entry = self.data.get(cleaned) or {}
             metadata = entry.get("metadata")
         return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def mutate_metadata(self, username: str, transform) -> Dict[str, Any]:
+        with self.lock:
+            entry = self.data.get(username)
+            if not isinstance(entry, dict):
+                raise KeyError(username)
+            updated = transform(dict(entry.get("metadata") or {}))
+            entry["metadata"] = updated
+            entry["updated_at"] = _timestamp(dt.datetime.now(UTC))
+            self._write()
+            return updated
 
     def set_metadata(self, username: str, metadata: Optional[Dict[str, Any]]) -> bool:
         cleaned = str(username or "").strip()
@@ -4314,6 +4447,7 @@ class FileTokenStore:
             "token": raw_token,
             "id": token_id,
             "user": username,
+            "token_hint": entry["token_hint"],
             "label": label,
             "created_at": entry["created_at"],
             "expires_at": entry["expires_at"],
@@ -4336,6 +4470,24 @@ class FileTokenStore:
             ttl_seconds=ttl_seconds,
             meta=meta,
             token=token,
+        )
+
+    def issue_orchestrator(
+        self,
+        username: str,
+        *,
+        label: Optional[str] = None,
+        ttl_seconds: Optional[int] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Issue a durable bearer token intended for a user's AARNN clients."""
+        return self._issue(
+            username,
+            kind="orchestrator",
+            label=label,
+            ttl_seconds=ttl_seconds,
+            meta={"purpose": "aarnn_orchestrator", **dict(meta or {})},
+            one_time=False,
         )
 
     def ensure_token(
@@ -4367,7 +4519,7 @@ class FileTokenStore:
             for entry in tokens:
                 if entry.get("token_hash") != token_hash:
                     continue
-                if entry.get("kind") != "access" or entry.get("disabled") or entry.get("one_time"):
+                if entry.get("kind") not in {"access", "orchestrator"} or entry.get("disabled") or entry.get("one_time"):
                     return None
                 if self._entry_expired(entry, now):
                     return None
@@ -4409,6 +4561,97 @@ class FileTokenStore:
             )
         rows.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return rows
+
+    def list_orchestrator_tokens(self, user: str) -> List[Dict[str, Any]]:
+        cleaned_user = str(user or "").strip()
+        if not cleaned_user:
+            return []
+        with self.lock:
+            tokens = [item for item in self.data.get("tokens", []) if isinstance(item, dict)]
+        rows: List[Dict[str, Any]] = []
+        for entry in tokens:
+            if entry.get("kind") != "orchestrator":
+                continue
+            if str(entry.get("username") or "").strip() != cleaned_user:
+                continue
+            rows.append(
+                {
+                    "id": entry.get("id"),
+                    "user": entry.get("username"),
+                    "token_hint": entry.get("token_hint"),
+                    "label": entry.get("label"),
+                    "created_at": entry.get("created_at"),
+                    "expires_at": entry.get("expires_at"),
+                    "last_used_at": entry.get("last_used_at"),
+                    "disabled": bool(entry.get("disabled")),
+                    "meta": dict(entry.get("meta") or {}),
+                }
+            )
+        rows.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return rows
+
+    def update_orchestrator(
+        self,
+        token_id: str,
+        username: str,
+        *,
+        label: str,
+        ttl_seconds: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        cleaned_id = str(token_id or "").strip()
+        cleaned_user = str(username or "").strip()
+        if not cleaned_id or not cleaned_user:
+            return None
+        expires_at = None
+        if ttl_seconds not in (None, ""):
+            expires_at = self._now() + dt.timedelta(seconds=max(30, int(ttl_seconds)))
+        with self.lock:
+            tokens = [item for item in self.data.get("tokens", []) if isinstance(item, dict)]
+            for entry in tokens:
+                if (
+                    entry.get("id") == cleaned_id
+                    and entry.get("username") == cleaned_user
+                    and entry.get("kind") == "orchestrator"
+                ):
+                    entry["label"] = label
+                    entry["expires_at"] = _timestamp(expires_at)
+                    entry["updated_at"] = _timestamp(self._now())
+                    self.data["tokens"] = tokens
+                    self._write()
+                    return {
+                        "id": entry.get("id"),
+                        "user": entry.get("username"),
+                        "token_hint": entry.get("token_hint"),
+                        "label": entry.get("label"),
+                        "created_at": entry.get("created_at"),
+                        "expires_at": entry.get("expires_at"),
+                        "last_used_at": entry.get("last_used_at"),
+                        "disabled": bool(entry.get("disabled")),
+                        "meta": dict(entry.get("meta") or {}),
+                    }
+        return None
+
+    def revoke_orchestrator(self, token_id: str, username: str) -> bool:
+        cleaned_id = str(token_id or "").strip()
+        cleaned_user = str(username or "").strip()
+        if not cleaned_id or not cleaned_user:
+            return False
+        with self.lock:
+            tokens = [item for item in self.data.get("tokens", []) if isinstance(item, dict)]
+            for entry in tokens:
+                if (
+                    entry.get("id") == cleaned_id
+                    and entry.get("username") == cleaned_user
+                    and entry.get("kind") == "orchestrator"
+                ):
+                    if entry.get("disabled"):
+                        return False
+                    entry["disabled"] = True
+                    entry["updated_at"] = _timestamp(self._now())
+                    self.data["tokens"] = tokens
+                    self._write()
+                    return True
+        return False
 
     def revoke(self, token_id: str) -> bool:
         cleaned = str(token_id or "").strip()

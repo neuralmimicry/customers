@@ -169,7 +169,7 @@ class Settings:
             cors_origins=env_list("CUSTOMERS_CORS_ORIGINS") or ([site_base.rstrip("/")] if site_base else []),
             state_dir=env_first("CUSTOMERS_STATE_DIR", default="data"),
             auth_mode=auth_mode,
-            password_min_length=max(8, env_int("CUSTOMERS_PASSWORD_MIN_LENGTH", default=12)),
+            password_min_length=max(12, env_int("CUSTOMERS_PASSWORD_MIN_LENGTH", default=12)),
             oidc_enabled=oidc_enabled,
             oidc_exchange_enabled=oidc_exchange_enabled,
             oidc_issuer=env_first("CUSTOMERS_OIDC_ISSUER", "NM_OIDC_ISSUER"),

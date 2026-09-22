@@ -1,3 +1,4 @@
+ARG TARGET_PAGE_SIZE=4k
 ARG CUSTOMERS_VERSION=0.1.0
 
 FROM python:3.13-slim AS builder
@@ -33,6 +34,7 @@ PY
 
 FROM python:3.13-slim
 ARG CUSTOMERS_VERSION
+ARG TARGET_PAGE_SIZE
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -42,6 +44,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 LABEL org.opencontainers.image.title="customers" \
+      org.opencontainers.image.page-size="${TARGET_PAGE_SIZE}" \
       org.opencontainers.image.version="${CUSTOMERS_VERSION}"
 
 COPY --from=builder /opt/venv /opt/venv

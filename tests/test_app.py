@@ -21,7 +21,7 @@ def _build_app(monkeypatch, tmp_path, *, self_registration=False):
     return create_app()
 
 
-def _setup_admin(client, username="alice", password="correct horse battery staple"):
+def _setup_admin(client, username="alice", password="Correct horse battery staple 12!"):
     response = client.post(
         "/api/setup",
         json={
@@ -40,13 +40,18 @@ def _admin_create_user(client, username, password, *, role="user", email=None):
         "/api/users",
         json={
             "username": username,
-            "password": password,
-            "confirm": password,
+            "password": password + "-Temporary",
+            "confirm": password + "-Temporary",
             "role": role,
             "email": email or f"{username}@example.com",
         },
     )
     assert response.status_code == 201
+    first_login = client.application.test_client()
+    result = _login(first_login, username, password + "-Temporary")
+    assert result.get_json()["requires_password_change"] is True
+    changed = first_login.post("/api/profile/password", json={"current_password": password + "-Temporary", "new_password": password, "confirm": password})
+    assert changed.status_code == 200
     return response.get_json()
 
 
@@ -109,8 +114,8 @@ def test_nmchain_events_are_non_blocking_and_parallel(monkeypatch, tmp_path):
         "/api/setup",
         json={
             "username": "alice",
-            "password": "correct horse battery staple",
-            "confirm": "correct horse battery staple",
+            "password": "Correct horse battery staple 12!",
+            "confirm": "Correct horse battery staple 12!",
             "email": "alice@example.com",
         },
     )
@@ -170,8 +175,8 @@ def test_auth_config_and_self_registration_create_workspace(monkeypatch, tmp_pat
         json={
             "username": "bob",
             "email": "bob@example.com",
-            "password": "bob password 123",
-            "confirm": "bob password 123",
+            "password": "Bob password 123!",
+            "confirm": "Bob password 123!",
             "create_team": True,
             "workspace_name": "Bob Workspace",
         },
@@ -192,7 +197,7 @@ def test_auth_config_and_self_registration_create_workspace(monkeypatch, tmp_pat
     assert session_payload["active_team"]["team_name"] == "Bob Workspace"
 
     relogin_client = app.test_client()
-    relogin_response = _login(relogin_client, "bob", "bob password 123")
+    relogin_response = _login(relogin_client, "bob", "Bob password 123!")
     assert relogin_response.status_code == 200
     assert relogin_response.get_json()["active_team"]["team_name"] == "Bob Workspace"
 
@@ -231,10 +236,10 @@ def test_totp_setup_and_login_flow(monkeypatch, tmp_path):
     app = _build_app(monkeypatch, tmp_path)
     admin_client = app.test_client()
     _setup_admin(admin_client)
-    _admin_create_user(admin_client, "bob", "bob password 123", email="bob@example.com")
+    _admin_create_user(admin_client, "bob", "Bob password 123!", email="bob@example.com")
 
     bob_client = app.test_client()
-    assert _login(bob_client, "bob", "bob password 123").status_code == 200
+    assert _login(bob_client, "bob", "Bob password 123!").status_code == 200
 
     start_response = bob_client.post("/api/profile/mfa/totp/start", json={})
     assert start_response.status_code == 200
@@ -254,7 +259,7 @@ def test_totp_setup_and_login_flow(monkeypatch, tmp_path):
     logout_response = bob_client.post("/api/logout")
     assert logout_response.status_code == 200
 
-    pending_login_response = _login(bob_client, "bob", "bob password 123")
+    pending_login_response = _login(bob_client, "bob", "Bob password 123!")
     assert pending_login_response.status_code == 202
     pending_payload = pending_login_response.get_json()
     assert pending_payload["status"] == "mfa_required"
@@ -280,13 +285,13 @@ def test_totp_setup_and_login_flow(monkeypatch, tmp_path):
     assert completed_payload["user"] == "bob"
     assert completed_payload["security"]["totp_enabled"] is True
 
-    disable_response = bob_client.post("/api/profile/mfa/totp/disable", json={})
+    disable_response = bob_client.post("/api/profile/mfa/totp/disable", json={"code": pyotp.TOTP(secret).now()})
     assert disable_response.status_code == 200
     disable_payload = disable_response.get_json()
     assert disable_payload["security"]["totp_enabled"] is False
 
     assert bob_client.post("/api/logout").status_code == 200
-    final_login_response = _login(bob_client, "bob", "bob password 123")
+    final_login_response = _login(bob_client, "bob", "Bob password 123!")
     assert final_login_response.status_code == 200
 
 
@@ -301,8 +306,8 @@ def test_passkey_registration_and_authentication_flow(monkeypatch, tmp_path):
         json={
             "username": "bob",
             "email": "bob@example.com",
-            "password": "bob password 123",
-            "confirm": "bob password 123",
+            "password": "Bob password 123!",
+            "confirm": "Bob password 123!",
         },
     )
     assert register_response.status_code == 201
@@ -425,7 +430,7 @@ def test_setup_creates_session_and_supports_internal_identity_routes(monkeypatch
     verify_response = client.post(
         "/api/internal/credentials/verify",
         headers={"Authorization": "Bearer test-billing-token"},
-        json={"username": "alice", "password": "correct horse battery staple"},
+        json={"username": "alice", "password": "Correct horse battery staple 12!"},
     )
     assert verify_response.status_code == 200
     assert verify_response.get_json()["authenticated"] is True
@@ -474,7 +479,7 @@ def test_admin_can_manage_users_and_reset_passwords(monkeypatch, tmp_path):
     create_payload = _admin_create_user(
         admin_client,
         "bob",
-        "temporary password 123",
+        "Temporary password 123!",
         role="user",
         email="bob@example.com",
     )
@@ -488,28 +493,28 @@ def test_admin_can_manage_users_and_reset_passwords(monkeypatch, tmp_path):
     assert users["bob"]["groups"] == ["user"]
 
     bob_client = app.test_client()
-    login_response = _login(bob_client, "bob", "temporary password 123")
+    login_response = _login(bob_client, "bob", "Temporary password 123!")
     assert login_response.status_code == 200
     assert login_response.get_json()["groups"] == ["user"]
 
     reset_response = admin_client.post(
         "/api/users/bob/password",
-        json={"password": "replacement password 456", "confirm": "replacement password 456"},
+        json={"password": "Replacement password 456!", "confirm": "Replacement password 456!"},
     )
     assert reset_response.status_code == 200
 
     bob_old_password_client = app.test_client()
-    old_login_response = _login(bob_old_password_client, "bob", "temporary password 123")
+    old_login_response = _login(bob_old_password_client, "bob", "Temporary password 123!")
     assert old_login_response.status_code == 401
 
     bob_new_password_client = app.test_client()
-    new_login_response = _login(bob_new_password_client, "bob", "replacement password 456")
+    new_login_response = _login(bob_new_password_client, "bob", "Replacement password 456!")
     assert new_login_response.status_code == 200
 
     verify_response = admin_client.post(
         "/api/internal/credentials/verify",
         headers={"Authorization": "Bearer test-billing-token"},
-        json={"username": "bob", "password": "replacement password 456"},
+        json={"username": "bob", "password": "Replacement password 456!"},
     )
     assert verify_response.status_code == 200
     verify_payload = verify_response.get_json()
@@ -523,12 +528,12 @@ def test_team_hierarchy_invites_acceptance_and_leave(monkeypatch, tmp_path):
     admin_client = app.test_client()
     _setup_admin(admin_client)
 
-    _admin_create_user(admin_client, "bob", "bob password 123", email="bob@example.com")
-    _admin_create_user(admin_client, "carol", "carol password 123", email="carol@example.com")
-    _admin_create_user(admin_client, "erin", "erin password 123", email="erin@example.com")
+    _admin_create_user(admin_client, "bob", "Bob password 123!", email="bob@example.com")
+    _admin_create_user(admin_client, "carol", "Carol password 123!", email="carol@example.com")
+    _admin_create_user(admin_client, "erin", "Erin password 123!", email="erin@example.com")
 
     bob_client = app.test_client()
-    assert _login(bob_client, "bob", "bob password 123").status_code == 200
+    assert _login(bob_client, "bob", "Bob password 123!").status_code == 200
 
     create_team_response = bob_client.post("/api/teams", json={"name": "Bob Team"})
     assert create_team_response.status_code == 201
@@ -556,7 +561,7 @@ def test_team_hierarchy_invites_acceptance_and_leave(monkeypatch, tmp_path):
     assert invitation["team_id"] == bob_team_id
 
     carol_client = app.test_client()
-    assert _login(carol_client, "carol", "carol password 123").status_code == 200
+    assert _login(carol_client, "carol", "Carol password 123!").status_code == 200
 
     profile_before_accept = carol_client.get("/api/profile")
     assert profile_before_accept.status_code == 200
@@ -594,7 +599,7 @@ def test_team_hierarchy_invites_acceptance_and_leave(monkeypatch, tmp_path):
     assert leave_payload["team_count"] == 0
 
     relogin_client = app.test_client()
-    relogin_response = _login(relogin_client, "carol", "carol password 123")
+    relogin_response = _login(relogin_client, "carol", "Carol password 123!")
     assert relogin_response.status_code == 200
     assert relogin_response.get_json()["user"] == "carol"
 
@@ -604,11 +609,11 @@ def test_user_can_reject_invite_and_change_own_password(monkeypatch, tmp_path):
     admin_client = app.test_client()
     _setup_admin(admin_client)
 
-    _admin_create_user(admin_client, "bob", "bob password 123", email="bob@example.com")
-    _admin_create_user(admin_client, "dave", "dave password 123", email="dave@example.com")
+    _admin_create_user(admin_client, "bob", "Bob password 123!", email="bob@example.com")
+    _admin_create_user(admin_client, "dave", "Dave password 123!", email="dave@example.com")
 
     bob_client = app.test_client()
-    assert _login(bob_client, "bob", "bob password 123").status_code == 200
+    assert _login(bob_client, "bob", "Bob password 123!").status_code == 200
     team_response = bob_client.post("/api/teams", json={"name": "Bob Team"})
     assert team_response.status_code == 201
     team_id = team_response.get_json()["id"]
@@ -618,7 +623,7 @@ def test_user_can_reject_invite_and_change_own_password(monkeypatch, tmp_path):
     invitation_id = invite_response.get_json()["id"]
 
     dave_client = app.test_client()
-    assert _login(dave_client, "dave", "dave password 123").status_code == 200
+    assert _login(dave_client, "dave", "Dave password 123!").status_code == 200
 
     reject_response = dave_client.post(f"/api/team-invitations/{invitation_id}/reject")
     assert reject_response.status_code == 200
@@ -633,18 +638,18 @@ def test_user_can_reject_invite_and_change_own_password(monkeypatch, tmp_path):
     password_change_response = dave_client.post(
         "/api/profile/password",
         json={
-            "current_password": "dave password 123",
-            "new_password": "dave replacement password 456",
-            "confirm": "dave replacement password 456",
+            "current_password": "Dave password 123!",
+            "new_password": "Dave replacement password 456!",
+            "confirm": "Dave replacement password 456!",
         },
     )
     assert password_change_response.status_code == 200
 
     dave_old_password_client = app.test_client()
-    assert _login(dave_old_password_client, "dave", "dave password 123").status_code == 401
+    assert _login(dave_old_password_client, "dave", "Dave password 123!").status_code == 401
 
     dave_new_password_client = app.test_client()
-    assert _login(dave_new_password_client, "dave", "dave replacement password 456").status_code == 200
+    assert _login(dave_new_password_client, "dave", "Dave replacement password 456!").status_code == 200
 
 
 def test_profile_settings_roundtrip_preserves_email(monkeypatch, tmp_path):
@@ -716,10 +721,10 @@ def test_default_session_exposes_service_access_contract(monkeypatch, tmp_path):
     app = _build_app(monkeypatch, tmp_path)
     admin_client = app.test_client()
     _setup_admin(admin_client)
-    _admin_create_user(admin_client, "bob", "bob password 123", email="bob@example.com")
+    _admin_create_user(admin_client, "bob", "Bob password 123!", email="bob@example.com")
 
     bob_client = app.test_client()
-    login_response = _login(bob_client, "bob", "bob password 123")
+    login_response = _login(bob_client, "bob", "Bob password 123!")
     assert login_response.status_code == 200
     login_payload = login_response.get_json()
 
@@ -771,15 +776,15 @@ def test_delegated_group_manager_can_manage_child_scope_with_parent_bounded_gran
     admin_client = app.test_client()
     _setup_admin(admin_client)
 
-    _admin_create_user(admin_client, "bob", "bob password 123", email="bob@example.com")
-    _admin_create_user(admin_client, "carol", "carol password 123", email="carol@example.com")
+    _admin_create_user(admin_client, "bob", "Bob password 123!", email="bob@example.com")
+    _admin_create_user(admin_client, "carol", "Carol password 123!", email="carol@example.com")
 
     _create_group(admin_client, "ops", parent_key="admin")
     _grant_group_service(admin_client, "ops", "billing", "control")
     _add_group_member(admin_client, "ops", "bob", membership_role="manager")
 
     bob_client = app.test_client()
-    assert _login(bob_client, "bob", "bob password 123").status_code == 200
+    assert _login(bob_client, "bob", "Bob password 123!").status_code == 200
 
     bob_groups_response = bob_client.get("/api/groups")
     assert bob_groups_response.status_code == 200
@@ -821,7 +826,7 @@ def test_delegated_group_manager_can_manage_child_scope_with_parent_bounded_gran
     assert effective_billing_grant["bounded_by_group"] == "ops"
 
     carol_client = app.test_client()
-    carol_login_response = _login(carol_client, "carol", "carol password 123")
+    carol_login_response = _login(carol_client, "carol", "Carol password 123!")
     assert carol_login_response.status_code == 200
     carol_payload = carol_login_response.get_json()
     assert carol_payload["is_admin"] is False
@@ -936,12 +941,89 @@ def test_service_account_session_and_token_lifecycle(monkeypatch, tmp_path):
     assert disabled_session_response.get_json() == {"authenticated": False, "user": None}
 
 
+def test_profile_orchestrator_token_lifecycle_and_bearer_auth(monkeypatch, tmp_path):
+    app = _build_app(monkeypatch, tmp_path)
+    client = app.test_client()
+    _setup_admin(client)
+    password_response = client.post(
+        "/api/profile/password",
+        json={
+            "current_password": "Correct horse battery staple 12!",
+            "new_password": "new Correct horse battery staple!1",
+            "confirm": "new Correct horse battery staple!1",
+        },
+    )
+    assert password_response.status_code == 200
+
+    list_response = client.get("/api/profile/orchestrator-tokens")
+    assert list_response.status_code == 200
+    assert list_response.get_json()["tokens"] == []
+
+    create_response = client.post(
+        "/api/profile/orchestrator-tokens",
+        json={"label": "Laptop AARNN", "expires_in_days": 30},
+    )
+    assert create_response.status_code == 201
+    create_payload = create_response.get_json()
+    token = create_payload["token"]
+    token_id = create_payload["token_record"]["id"]
+    assert token
+    assert create_payload["token_record"]["label"] == "Laptop AARNN"
+    assert create_payload["token_record"]["status"] == "active"
+
+    listed = client.get("/api/profile/orchestrator-tokens").get_json()["tokens"]
+    assert listed[0]["id"] == token_id
+    assert "token" not in listed[0]
+    assert listed[0]["token_hint"]
+
+    bearer_session = app.test_client().get(
+        "/api/session",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert bearer_session.status_code == 200
+    assert bearer_session.get_json()["user"] == "alice"
+
+    update_response = client.patch(
+        f"/api/profile/orchestrator-tokens/{token_id}",
+        json={"label": "Renamed laptop", "expires_in_days": 0},
+    )
+    assert update_response.status_code == 200
+    assert update_response.get_json()["token_record"]["label"] == "Renamed laptop"
+    assert update_response.get_json()["token_record"]["expires_at"] is None
+
+    rotate_response = client.post(
+        f"/api/profile/orchestrator-tokens/{token_id}/rotate",
+        json={"label": "Rotated laptop", "expires_in_days": 0},
+    )
+    assert rotate_response.status_code == 201
+    replacement = rotate_response.get_json()["token"]
+    replacement_id = rotate_response.get_json()["token_record"]["id"]
+    assert replacement and replacement_id != token_id
+    assert app.test_client().get(
+        "/api/session", headers={"Authorization": f"Bearer {token}"}
+    ).get_json() == {"authenticated": False, "user": None}
+    assert app.test_client().get(
+        "/api/session", headers={"Authorization": f"Bearer {replacement}"}
+    ).get_json()["authenticated"] is True
+
+    revoke_response = client.delete(f"/api/profile/orchestrator-tokens/{replacement_id}")
+    assert revoke_response.status_code == 200
+    assert app.test_client().get(
+        "/api/session", headers={"Authorization": f"Bearer {replacement}"}
+    ).get_json() == {"authenticated": False, "user": None}
+
+    assert app.test_client().get(
+        "/api/profile/orchestrator-tokens",
+        headers={"Authorization": f"Bearer {replacement}"},
+    ).status_code == 401
+
+
 def test_service_account_creation_respects_delegated_group_scope(monkeypatch, tmp_path):
     app = _build_app(monkeypatch, tmp_path)
     admin_client = app.test_client()
     _setup_admin(admin_client)
 
-    _admin_create_user(admin_client, "bob", "bob password 123", email="bob@example.com")
+    _admin_create_user(admin_client, "bob", "Bob password 123!", email="bob@example.com")
     _create_group(admin_client, "ops", parent_key="admin")
     _create_group(admin_client, "ops-team", parent_key="ops")
     _create_group(admin_client, "sales", parent_key="admin")
@@ -950,7 +1032,7 @@ def test_service_account_creation_respects_delegated_group_scope(monkeypatch, tm
     _grant_group_service(admin_client, "sales", "continuum", "observe")
 
     bob_client = app.test_client()
-    assert _login(bob_client, "bob", "bob password 123").status_code == 200
+    assert _login(bob_client, "bob", "Bob password 123!").status_code == 200
 
     allowed_response = bob_client.post(
         "/api/service-accounts",
@@ -1009,7 +1091,7 @@ def test_internal_routes_accept_trusted_service_account_tokens(monkeypatch, tmp_
     verify_response = app.test_client().post(
         "/api/internal/credentials/verify",
         headers={"Authorization": f"Bearer {trusted_token}"},
-        json={"username": "alice", "password": "correct horse battery staple"},
+        json={"username": "alice", "password": "Correct horse battery staple 12!"},
     )
     assert verify_response.status_code == 200
     assert verify_response.get_json()["authenticated"] is True
@@ -1047,8 +1129,8 @@ def test_setup_rejects_reserved_service_account_username(monkeypatch, tmp_path):
         "/api/setup",
         json={
             "username": "svc_setup-bot",
-            "password": "correct horse battery staple",
-            "confirm": "correct horse battery staple",
+            "password": "Correct horse battery staple 12!",
+            "confirm": "Correct horse battery staple 12!",
             "email": "setup@example.com",
         },
     )

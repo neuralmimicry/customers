@@ -70,6 +70,15 @@ DEFAULT_GROUPS: Sequence[Dict[str, Any]] = (
 
 DEFAULT_SERVICE_CATALOG: Sequence[Dict[str, Any]] = (
     {
+        "service_key": "aria",
+        "display_name": "Aria",
+        "description": "AI governance, incident monitoring, and runtime policy management.",
+        "public_access_level": SERVICE_ACCESS_NONE,
+        "dashboard_url": "https://aria.neuralmimicry.ai",
+        "marketing_url": "/about",
+        "metadata": {"category": "platform"},
+    },
+    {
         "service_key": "refiner",
         "display_name": "Refiner",
         "description": "Research, planning, and delivery workflows.",

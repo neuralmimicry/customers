@@ -33,8 +33,9 @@
         </label>
         <label class="field">
           <span>Password</span>
-          <input id="password" name="password" type="password" required autocomplete="new-password">
+          <input id="password" name="password" type="password" minlength="{{ password_min_length }}" required autocomplete="new-password">
         </label>
+        <p class="hint">Use at least {{ password_min_length }} characters, including uppercase and lowercase letters, a number and a symbol.</p>
         <label class="field">
           <span>Confirm password</span>
           <input id="confirm" name="confirm" type="password" required autocomplete="new-password">

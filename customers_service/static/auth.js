@@ -136,6 +136,10 @@
   };
 
   const finishAuth = (payload) => {
+    if (payload?.requires_password_change && payload?.next_url) {
+      window.location.href = payload.next_url;
+      return;
+    }
     if (redirectViaSso(payload?.sso_token || payload?.token)) {
       return;
     }
