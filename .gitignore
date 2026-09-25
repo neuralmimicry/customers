@@ -43,3 +43,15 @@ instance/
 # Editor settings
 .idea/
 .vscode/
+
+# project_solver ignore additions
+.refiner/
+.research_cache/
+project_solver_output/
+delivery_pipeline_output/
+node_modules/
+.cache/
+.next/
+.nuxt/
+.turbo/
+coverage/
