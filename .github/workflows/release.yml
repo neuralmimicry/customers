@@ -157,6 +157,12 @@ jobs:
           name: customers-dist-${{ steps.version.outputs.tag }}
           path: dist/*
 
+      - name: Set up rootless Docker
+        uses: docker/setup-docker-action@v5
+        with:
+          set-host: true
+          rootless: true
+
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
