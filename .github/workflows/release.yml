@@ -201,7 +201,10 @@ jobs:
           labels: |
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/neuralmimicry/customers
+          annotations: |
+            index:org.opencontainers.image.source=https://github.com/neuralmimicry/customers
+            index:org.opencontainers.image.description=Identity service: registration, authentication, 2FA, passkeys, SSO, OIDC, and delegated group management for the NeuralMimicry platform
 
       - name: Build and push ARM64 64K HWE image
         uses: docker/build-push-action@v6
@@ -219,7 +222,7 @@ jobs:
           labels: |
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/neuralmimicry/customers
 
       - name: Publish explicit ARM64 4K image variant
         uses: docker/build-push-action@v6
@@ -237,7 +240,7 @@ jobs:
           labels: |
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/neuralmimicry/customers
 
       - name: Create or update GitHub release
         env:
