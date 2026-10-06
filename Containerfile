@@ -44,6 +44,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 LABEL org.opencontainers.image.title="customers" \
+      org.opencontainers.image.source="https://github.com/neuralmimicry/customers" \
+      org.opencontainers.image.url="https://github.com/neuralmimicry/customers" \
+      org.opencontainers.image.description="Identity service: registration, authentication, 2FA, passkeys, SSO, OIDC, and delegated group management for the NeuralMimicry platform" \
+      org.opencontainers.image.vendor="NeuralMimicry" \
       org.opencontainers.image.page-size="${TARGET_PAGE_SIZE}" \
       org.opencontainers.image.version="${CUSTOMERS_VERSION}"
 
